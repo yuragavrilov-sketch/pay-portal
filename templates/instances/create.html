@@ -59,7 +59,7 @@
               <select name="server_id[]" class="form-select form-select-sm">
                 <option value="">— выберите сервер —</option>
                 {% for srv in servers %}
-                <option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environment.name }}]</option>
+                <option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environments | map(attribute='name') | join(', ') }}]</option>
                 {% endfor %}
               </select>
             </td>
@@ -93,7 +93,7 @@
 
 {% block extra_js %}
 <script>
-const serverOptions = `{% for srv in servers %}<option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environment.name }}]</option>{% endfor %}`;
+const serverOptions = `{% for srv in servers %}<option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environments | map(attribute='name') | join(', ') }}]</option>{% endfor %}`;
 
 function addRow() {
   const tbody = document.getElementById('rowsBody');

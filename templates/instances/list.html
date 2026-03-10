@@ -40,7 +40,7 @@
         </td>
         <td>{{ inst.service.display_name or inst.service.name }}</td>
         <td>{{ inst.server.hostname }}</td>
-        <td><span class="badge bg-secondary">{{ inst.server.environment.name }}</span></td>
+        <td>{% for env in inst.server.environments %}<span class="badge bg-secondary me-1">{{ env.name }}</span>{% endfor %}</td>
         <td class="text-center">
           {% set st = inst.status | lower %}
           <span id="status-{{ inst.id }}" class="badge

@@ -42,7 +42,7 @@
             <a href="{{ url_for('server_edit', server_id=inst.server.id) }}">
               {{ inst.server.hostname }}
             </a>
-            <span class="badge bg-secondary ms-1">{{ inst.server.environment.name }}</span>
+            {% for env in inst.server.environments %}<span class="badge bg-secondary ms-1">{{ env.name }}</span>{% endfor %}
           </dd>
 
           <dt class="col-sm-4">EXE путь</dt>
