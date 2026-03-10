@@ -9,117 +9,378 @@
   </ol>
 </nav>
 
-<div class="card">
-  <div class="card-header fw-semibold">
-    <i class="bi bi-ui-checks-grid me-1"></i>
-    Массовое добавление экземпляров
-  </div>
-  <div class="card-body">
-    <div class="alert alert-info py-2 small mb-3">
-      <i class="bi bi-info-circle me-1"></i>
-      Выберите сервис, добавьте строки «сервер + имя Windows-сервиса».
-      При добавлении автоматически определится путь к exe и конфигурационная директория
-      (<code>&lt;exe_dir&gt;\config</code>), а конфиги будут загружены в БД.
-    </div>
+<div class="row g-3">
 
-    <form method="post" id="bulkForm">
-      {# Сервис #}
-      <div class="mb-4">
-        <label class="form-label fw-semibold">Сервис (каталог) <span class="text-danger">*</span></label>
+  {# ── Left column: controls ──────────────────────────────────────────────── #}
+  <div class="col-lg-5">
+
+    {# Step 1 — service catalog #}
+    <div class="card mb-3">
+      <div class="card-header fw-semibold">
+        <span class="badge bg-secondary me-1">1</span>
+        Выберите сервис из каталога
+      </div>
+      <div class="card-body">
         {% if services %}
-        <select name="service_id" class="form-select" required style="max-width:400px;">
+        <select id="catalogSelect" class="form-select">
           {% for svc in services %}
           <option value="{{ svc.id }}">
-            {{ svc.display_name or svc.name }}
-            {% if svc.display_name %} ({{ svc.name }}){% endif %}
+            {{ svc.display_name or svc.name }}{% if svc.display_name %} ({{ svc.name }}){% endif %}
           </option>
           {% endfor %}
         </select>
         {% else %}
-        <div class="text-danger">
-          Каталог сервисов пуст.
-          <a href="{{ url_for('service_create') }}">Добавьте сервис</a> сначала.
+        <div class="text-danger small">
+          Каталог пуст. <a href="{{ url_for('service_create') }}">Добавьте сервис</a> сначала.
         </div>
         {% endif %}
       </div>
+    </div>
 
-      {# Rows #}
-      <div class="mb-2 fw-semibold">Экземпляры</div>
-      <table class="table table-bordered align-middle mb-2" id="rowsTable">
-        <thead class="table-active">
-          <tr>
-            <th style="width:40%">Сервер</th>
-            <th>Имя Windows-сервиса</th>
-            <th style="width:40px;"></th>
-          </tr>
-        </thead>
-        <tbody id="rowsBody">
-          <tr>
-            <td>
-              <select name="server_id[]" class="form-select form-select-sm">
-                <option value="">— выберите сервер —</option>
-                {% for srv in servers %}
-                <option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environments | map(attribute='name') | join(', ') }}]</option>
-                {% endfor %}
-              </select>
-            </td>
-            <td>
-              <input type="text" name="win_service_name[]" class="form-control form-control-sm font-monospace"
-                     placeholder="MyApp.WorkerService">
-            </td>
-            <td class="text-center">
-              <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeRow(this)">
-                <i class="bi bi-x"></i>
-              </button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-
-      <button type="button" class="btn btn-sm btn-outline-secondary mb-4" onclick="addRow()">
-        <i class="bi bi-plus me-1"></i>Добавить строку
-      </button>
-
-      <div class="d-flex gap-2">
-        <button type="submit" class="btn btn-primary" {% if not services %}disabled{% endif %}>
-          <i class="bi bi-cloud-download me-1"></i>Добавить и загрузить конфиги
-        </button>
-        <a href="{{ url_for('instance_list') }}" class="btn btn-outline-secondary">Отмена</a>
+    {# Step 2 — pick server and load services #}
+    <div class="card mb-3">
+      <div class="card-header fw-semibold">
+        <span class="badge bg-secondary me-1">2</span>
+        Загрузите сервисы с сервера
       </div>
-    </form>
+      <div class="card-body">
+        {% if servers %}
+        <div class="d-flex gap-2 mb-3">
+          <select id="serverSelect" class="form-select">
+            <option value="">— выберите сервер —</option>
+            {% for srv in servers %}
+            <option value="{{ srv.id }}"
+                    data-hostname="{{ srv.hostname }}"
+                    data-available="{{ 'true' if srv.is_available else 'false' }}">
+              {{ srv.hostname }}
+              <small>[{{ srv.environments | map(attribute='name') | join(', ') }}]</small>
+            </option>
+            {% endfor %}
+          </select>
+          <button type="button" id="btnLoad" class="btn btn-outline-primary text-nowrap" disabled>
+            <i class="bi bi-cloud-download me-1"></i>Загрузить
+          </button>
+        </div>
+
+        {# Search + list of discovered services #}
+        <div id="svcPanel" class="d-none">
+          <div class="input-group input-group-sm mb-2">
+            <span class="input-group-text"><i class="bi bi-search"></i></span>
+            <input type="text" id="svcSearch" class="form-control" placeholder="Поиск по имени...">
+            <button type="button" class="btn btn-outline-secondary" id="btnSelectAll" title="Выбрать все">
+              <i class="bi bi-check-all"></i>
+            </button>
+            <button type="button" class="btn btn-outline-secondary" id="btnDeselectAll" title="Снять всё">
+              <i class="bi bi-square"></i>
+            </button>
+          </div>
+
+          <div id="svcList"
+               class="border rounded overflow-auto"
+               style="max-height:320px; font-size:.85rem;">
+            {# filled by JS #}
+          </div>
+
+          <div class="d-flex align-items-center justify-content-between mt-2">
+            <small class="text-muted" id="svcCount"></small>
+            <button type="button" id="btnAddSelected" class="btn btn-sm btn-primary" disabled>
+              <i class="bi bi-plus-lg me-1"></i>Добавить выбранные
+            </button>
+          </div>
+        </div>
+
+        <div id="svcLoading" class="d-none text-center py-3">
+          <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+          Загрузка сервисов…
+        </div>
+        <div id="svcError" class="d-none alert alert-danger py-2 small mb-0"></div>
+
+        {% else %}
+        <div class="text-muted small">Нет доступных серверов для выбранного окружения.</div>
+        {% endif %}
+      </div>
+    </div>
   </div>
+
+  {# ── Right column: queue table ───────────────────────────────────────────── #}
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header fw-semibold d-flex align-items-center justify-content-between">
+        <span>
+          <span class="badge bg-secondary me-1">3</span>
+          Очередь на добавление
+        </span>
+        <span class="badge bg-primary" id="queueBadge">0</span>
+      </div>
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table class="table table-sm table-hover mb-0" id="queueTable">
+            <thead class="table-active">
+              <tr>
+                <th>Сервер</th>
+                <th>Windows-сервис</th>
+                <th>Каталог</th>
+                <th style="width:40px;"></th>
+              </tr>
+            </thead>
+            <tbody id="queueBody">
+              <tr id="queueEmpty">
+                <td colspan="4" class="text-center text-muted py-4">
+                  <i class="bi bi-inbox fs-4 d-block mb-1"></i>
+                  Выберите сервисы слева и нажмите «Добавить выбранные»
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card-footer">
+        <form method="post" id="bulkForm">
+          <div id="hiddenInputs"></div>
+          <div class="d-flex gap-2">
+            <button type="submit" id="btnSubmit" class="btn btn-success" disabled>
+              <i class="bi bi-cloud-download me-1"></i>Создать и загрузить конфиги
+            </button>
+            <a href="{{ url_for('instance_list') }}" class="btn btn-outline-secondary">Отмена</a>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
 </div>
 {% endblock %}
 
+
 {% block extra_js %}
 <script>
-const serverOptions = `{% for srv in servers %}<option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environments | map(attribute='name') | join(', ') }}]</option>{% endfor %}`;
+/* ── State ─────────────────────────────────────────────────────────────────── */
+// queue: [{server_id, hostname, win_service_name, display_name, catalog_id, catalog_label}]
+const queue = [];
 
-function addRow() {
-  const tbody = document.getElementById('rowsBody');
-  const tr = document.createElement('tr');
-  tr.innerHTML = `
-    <td>
-      <select name="server_id[]" class="form-select form-select-sm">
-        <option value="">— выберите сервер —</option>
-        ${serverOptions}
-      </select>
-    </td>
-    <td>
-      <input type="text" name="win_service_name[]" class="form-control form-control-sm font-monospace"
-             placeholder="MyApp.WorkerService">
-    </td>
-    <td class="text-center">
-      <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeRow(this)">
-        <i class="bi bi-x"></i>
-      </button>
-    </td>`;
-  tbody.appendChild(tr);
+const catalogSelect   = document.getElementById('catalogSelect');
+const serverSelect    = document.getElementById('serverSelect');
+const btnLoad         = document.getElementById('btnLoad');
+const svcPanel        = document.getElementById('svcPanel');
+const svcLoading      = document.getElementById('svcLoading');
+const svcError        = document.getElementById('svcError');
+const svcSearch       = document.getElementById('svcSearch');
+const svcList         = document.getElementById('svcList');
+const svcCount        = document.getElementById('svcCount');
+const btnAddSelected  = document.getElementById('btnAddSelected');
+const btnSelectAll    = document.getElementById('btnSelectAll');
+const btnDeselectAll  = document.getElementById('btnDeselectAll');
+const queueBody       = document.getElementById('queueBody');
+const queueEmpty      = document.getElementById('queueEmpty');
+const queueBadge      = document.getElementById('queueBadge');
+const hiddenInputs    = document.getElementById('hiddenInputs');
+const btnSubmit       = document.getElementById('btnSubmit');
+
+let loadedServices = [];   // [{name, display_name, status}]
+let currentServerId   = null;
+let currentHostname   = null;
+
+/* ── Server select → enable Load button ────────────────────────────────────── */
+serverSelect.addEventListener('change', () => {
+  const opt = serverSelect.selectedOptions[0];
+  btnLoad.disabled = !serverSelect.value;
+  // reset panel if server changed
+  if (serverSelect.value !== String(currentServerId)) {
+    svcPanel.classList.add('d-none');
+    svcError.classList.add('d-none');
+    loadedServices = [];
+  }
+});
+
+/* ── Load services via AJAX ─────────────────────────────────────────────────── */
+btnLoad.addEventListener('click', async () => {
+  const sid      = serverSelect.value;
+  const opt      = serverSelect.selectedOptions[0];
+  const hostname = opt.dataset.hostname;
+  if (!sid) return;
+
+  currentServerId = sid;
+  currentHostname = hostname;
+
+  svcPanel.classList.add('d-none');
+  svcError.classList.add('d-none');
+  svcLoading.classList.remove('d-none');
+  btnLoad.disabled = true;
+
+  try {
+    const resp = await fetch(`/api/servers/${sid}/services`);
+    const data = await resp.json();
+    svcLoading.classList.add('d-none');
+    btnLoad.disabled = false;
+
+    if (!data.ok) {
+      svcError.textContent = 'Ошибка: ' + data.error;
+      svcError.classList.remove('d-none');
+      return;
+    }
+
+    loadedServices = data.services;
+    renderServiceList(loadedServices);
+    svcPanel.classList.remove('d-none');
+  } catch (e) {
+    svcLoading.classList.add('d-none');
+    btnLoad.disabled = false;
+    svcError.textContent = 'Сетевая ошибка: ' + e.message;
+    svcError.classList.remove('d-none');
+  }
+});
+
+/* ── Render checkbox list ───────────────────────────────────────────────────── */
+function renderServiceList(services) {
+  const filter = svcSearch.value.toLowerCase();
+  const visible = filter
+    ? services.filter(s =>
+        s.name.toLowerCase().includes(filter) ||
+        s.display_name.toLowerCase().includes(filter))
+    : services;
+
+  if (!visible.length) {
+    svcList.innerHTML = '<div class="text-muted text-center py-3 small">Ничего не найдено</div>';
+    svcCount.textContent = '';
+    updateAddBtn();
+    return;
+  }
+
+  svcList.innerHTML = visible.map(s => {
+    const alreadyQueued = queue.some(
+      q => q.server_id == currentServerId && q.win_service_name === s.name
+    );
+    const stateClass = {running: 'text-success', stopped: 'text-danger'}[s.status] || 'text-muted';
+    const stateIcon  = {running: 'bi-play-fill', stopped: 'bi-stop-fill'}[s.status] || 'bi-question-circle';
+    return `
+      <label class="d-flex align-items-start gap-2 px-3 py-2 border-bottom svc-item
+                    ${alreadyQueued ? 'opacity-50' : ''}"
+             style="cursor:pointer;">
+        <input type="checkbox" class="form-check-input mt-0 flex-shrink-0 svc-checkbox"
+               value="${escHtml(s.name)}"
+               ${alreadyQueued ? 'disabled checked' : ''}
+               style="margin-top:2px;">
+        <div class="flex-grow-1 lh-sm">
+          <div class="fw-medium font-monospace">${escHtml(s.name)}</div>
+          <div class="text-muted small">${escHtml(s.display_name)}</div>
+        </div>
+        <i class="bi ${stateIcon} ${stateClass} flex-shrink-0 mt-1" title="${s.status}"></i>
+      </label>`;
+  }).join('');
+
+  svcCount.textContent = `Показано: ${visible.length} из ${services.length}`;
+  svcList.querySelectorAll('.svc-checkbox').forEach(cb =>
+    cb.addEventListener('change', updateAddBtn)
+  );
+  updateAddBtn();
 }
 
-function removeRow(btn) {
-  const rows = document.querySelectorAll('#rowsBody tr');
-  if (rows.length > 1) btn.closest('tr').remove();
+function updateAddBtn() {
+  const checked = svcList.querySelectorAll('.svc-checkbox:checked:not(:disabled)').length;
+  btnAddSelected.disabled = checked === 0;
+  btnAddSelected.textContent = checked
+    ? `Добавить выбранные (${checked})`
+    : 'Добавить выбранные';
+}
+
+/* ── Search filter ──────────────────────────────────────────────────────────── */
+svcSearch.addEventListener('input', () => renderServiceList(loadedServices));
+
+btnSelectAll.addEventListener('click', () => {
+  svcList.querySelectorAll('.svc-checkbox:not(:disabled)').forEach(cb => {
+    cb.checked = true; cb.dispatchEvent(new Event('change'));
+  });
+});
+btnDeselectAll.addEventListener('click', () => {
+  svcList.querySelectorAll('.svc-checkbox:not(:disabled)').forEach(cb => {
+    cb.checked = false; cb.dispatchEvent(new Event('change'));
+  });
+});
+
+/* ── Add selected to queue ──────────────────────────────────────────────────── */
+btnAddSelected.addEventListener('click', () => {
+  if (!catalogSelect) return;
+  const catalogId    = catalogSelect.value;
+  const catalogLabel = catalogSelect.selectedOptions[0].text.trim();
+
+  svcList.querySelectorAll('.svc-checkbox:checked:not(:disabled)').forEach(cb => {
+    const name = cb.value;
+    const svc  = loadedServices.find(s => s.name === name);
+    if (!queue.some(q => q.server_id == currentServerId && q.win_service_name === name)) {
+      queue.push({
+        server_id:        currentServerId,
+        hostname:         currentHostname,
+        win_service_name: name,
+        display_name:     svc ? svc.display_name : '',
+        catalog_id:       catalogId,
+        catalog_label:    catalogLabel,
+      });
+    }
+  });
+
+  renderQueue();
+  renderServiceList(loadedServices);   // refresh — mark added items
+});
+
+/* ── Queue table ────────────────────────────────────────────────────────────── */
+function renderQueue() {
+  queueBadge.textContent = queue.length;
+  btnSubmit.disabled = queue.length === 0;
+
+  if (!queue.length) {
+    queueEmpty.classList.remove('d-none');
+    hiddenInputs.innerHTML = '';
+    return;
+  }
+
+  queueEmpty.classList.add('d-none');
+
+  // Build table rows (keep existing rows, replace all for simplicity)
+  const rows = queue.map((item, idx) => `
+    <tr>
+      <td class="font-monospace small">${escHtml(item.hostname)}</td>
+      <td>
+        <div class="font-monospace small">${escHtml(item.win_service_name)}</div>
+        ${item.display_name
+          ? `<div class="text-muted" style="font-size:.75rem;">${escHtml(item.display_name)}</div>`
+          : ''}
+      </td>
+      <td><span class="badge bg-secondary">${escHtml(item.catalog_label)}</span></td>
+      <td class="text-center">
+        <button type="button" class="btn btn-sm btn-outline-danger py-0 px-1"
+                onclick="removeFromQueue(${idx})" title="Убрать">
+          <i class="bi bi-x"></i>
+        </button>
+      </td>
+    </tr>`).join('');
+
+  // Replace all rows except #queueEmpty
+  const tbody = document.getElementById('queueBody');
+  tbody.innerHTML = '';
+  tbody.innerHTML = rows;
+  tbody.appendChild(queueEmpty);   // keep placeholder in DOM
+
+  // Hidden form inputs
+  hiddenInputs.innerHTML = queue.map(item => `
+    <input type="hidden" name="server_id[]"       value="${escHtml(item.server_id)}">
+    <input type="hidden" name="win_service_name[]" value="${escHtml(item.win_service_name)}">
+    <input type="hidden" name="service_id[]"       value="${escHtml(item.catalog_id)}">
+  `).join('');
+}
+
+function removeFromQueue(idx) {
+  queue.splice(idx, 1);
+  renderQueue();
+  if (loadedServices.length) renderServiceList(loadedServices);  // unmark removed
+}
+
+/* ── Helpers ────────────────────────────────────────────────────────────────── */
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 </script>
 {% endblock %}

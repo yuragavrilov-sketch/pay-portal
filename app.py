@@ -326,6 +326,15 @@ def create_app():
         flash(f'Сервер "{hostname}" удалён.', 'success')
         return redirect(url_for('server_list'))
 
+    @app.route('/api/servers/<int:server_id>/services')
+    def api_server_services(server_id):
+        """Return list of Windows services on the server as JSON."""
+        server = Server.query.get_or_404(server_id)
+        services, error = winrm_utils.list_services(server)
+        if error:
+            return jsonify({'ok': False, 'error': error, 'services': []})
+        return jsonify({'ok': True, 'error': None, 'services': services})
+
     @app.route('/servers/<int:server_id>/test', methods=['POST'])
     def server_test(server_id):
         server = Server.query.get_or_404(server_id)
@@ -412,12 +421,13 @@ def create_app():
         servers = servers_q.order_by(Server.hostname).all()
 
         if request.method == 'POST':
-            service_id = int(request.form['service_id'])
-            server_ids = request.form.getlist('server_id[]')
-            win_names  = request.form.getlist('win_service_name[]')
+            server_ids  = request.form.getlist('server_id[]')
+            win_names   = request.form.getlist('win_service_name[]')
+            service_ids = request.form.getlist('service_id[]')
 
             created, errors = 0, []
-            for srv_id, win_name in zip(server_ids, win_names):
+            for srv_id, win_name, service_id in zip(server_ids, win_names, service_ids):
+                service_id = int(service_id)
                 win_name = win_name.strip()
                 if not win_name or not srv_id:
                     continue

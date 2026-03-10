@@ -168,6 +168,40 @@ def fetch_all_configs(server, config_dir: str) -> list[dict]:
     return results
 
 
+def list_services(server) -> tuple[list[dict], Optional[str]]:
+    """
+    Enumerate all Windows services on the server.
+    Returns (services, error_message).
+    services — list of {name, display_name, status}
+    """
+    if not WINRM_AVAILABLE:
+        return [], "pywinrm not installed"
+    try:
+        session = _get_session(server)
+        ps = """
+Get-WmiObject Win32_Service | Sort-Object Name | ForEach-Object {
+    Write-Output "$($_.Name)|$($_.DisplayName)|$($_.State)"
+}
+"""
+        r = session.run_ps(ps)
+        if r.status_code != 0:
+            return [], r.std_err.decode(errors='replace').strip()
+        services = []
+        for line in r.std_out.decode(errors='replace').splitlines():
+            line = line.strip()
+            if not line or '|' not in line:
+                continue
+            parts = line.split('|', 2)
+            services.append({
+                'name':         parts[0].strip(),
+                'display_name': parts[1].strip() if len(parts) > 1 else '',
+                'status':       parts[2].strip().lower() if len(parts) > 2 else 'unknown',
+            })
+        return services, None
+    except Exception as e:
+        return [], str(e)
+
+
 def get_service_status(server, win_service_name: str) -> str:
     """Quick status poll for a single service. Returns lowercase state string."""
     if not WINRM_AVAILABLE:
