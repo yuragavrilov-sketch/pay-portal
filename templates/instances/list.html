@@ -1,0 +1,121 @@
+{% extends 'base.html' %}
+{% block title %}Экземпляры сервисов{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">
+    <i class="bi bi-ui-checks-grid me-2"></i>Экземпляры сервисов
+    {% if current_env %}
+    <span class="badge bg-primary fs-6 ms-1">{{ current_env.name }}</span>
+    {% endif %}
+  </h4>
+  <a href="{{ url_for('instance_create') }}" class="btn btn-primary btn-sm">
+    <i class="bi bi-plus-lg me-1"></i>Добавить
+  </a>
+</div>
+
+{% if instances %}
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead class="table-active">
+      <tr>
+        <th>Win Service</th>
+        <th>Сервис (каталог)</th>
+        <th>Сервер</th>
+        <th>ENV</th>
+        <th class="text-center">Статус</th>
+        <th class="text-center">Конфигов</th>
+        <th>Проверено</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for inst in instances %}
+      <tr id="inst-row-{{ inst.id }}">
+        <td class="font-monospace">
+          <a href="{{ url_for('instance_detail', instance_id=inst.id) }}"
+             class="text-decoration-none fw-semibold">
+            {{ inst.win_service_name }}
+          </a>
+        </td>
+        <td>{{ inst.service.display_name or inst.service.name }}</td>
+        <td>{{ inst.server.hostname }}</td>
+        <td><span class="badge bg-secondary">{{ inst.server.environment.name }}</span></td>
+        <td class="text-center">
+          {% set st = inst.status | lower %}
+          <span id="status-{{ inst.id }}" class="badge
+            {% if st == 'running' %}bg-success
+            {% elif st == 'stopped' %}bg-danger
+            {% elif st in ('starting', 'stop pending') %}bg-warning text-dark
+            {% else %}bg-secondary{% endif %}">
+            {{ inst.status }}
+          </span>
+        </td>
+        <td class="text-center">
+          <span class="badge bg-dark">{{ inst.configs | length }}</span>
+        </td>
+        <td class="text-muted small">
+          {{ inst.last_status_check.strftime('%d.%m %H:%M') if inst.last_status_check else '—' }}
+        </td>
+        <td class="text-end text-nowrap">
+          <button class="btn btn-sm btn-outline-info me-1"
+                  onclick="refreshStatus({{ inst.id }})" title="Обновить статус">
+            <i class="bi bi-arrow-clockwise" id="spin-{{ inst.id }}"></i>
+          </button>
+          <a href="{{ url_for('instance_detail', instance_id=inst.id) }}"
+             class="btn btn-sm btn-outline-secondary me-1" title="Детали">
+            <i class="bi bi-eye"></i>
+          </a>
+          <form method="post" action="{{ url_for('instance_delete', instance_id=inst.id) }}"
+                class="d-inline"
+                onsubmit="return confirm('Удалить экземпляр {{ inst.win_service_name }}?')">
+            <button class="btn btn-sm btn-outline-danger">
+              <i class="bi bi-trash3"></i>
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="text-center py-5 text-muted">
+  <i class="bi bi-ui-checks-grid fs-1 d-block mb-2"></i>
+  {% if current_env %}
+  В окружении «{{ current_env.name }}» нет экземпляров.
+  {% else %}
+  Экземпляров нет.
+  {% endif %}
+  <a href="{{ url_for('instance_create') }}">Добавить?</a>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script>
+async function refreshStatus(id) {
+  const icon = document.getElementById('spin-' + id);
+  const badge = document.getElementById('status-' + id);
+  icon.classList.add('spin');
+  try {
+    const resp = await fetch(`/instances/${id}/refresh-status`, {method:'POST'});
+    const data = await resp.json();
+    const st = data.status.toLowerCase();
+    badge.textContent = data.status;
+    badge.className = 'badge ' + (
+      st === 'running' ? 'bg-success' :
+      st === 'stopped' ? 'bg-danger' :
+      ['starting','stop pending'].includes(st) ? 'bg-warning text-dark' :
+      'bg-secondary'
+    );
+  } finally {
+    icon.classList.remove('spin');
+  }
+}
+</script>
+<style>
+.spin { animation: spin .8s linear infinite; display:inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+{% endblock %}

@@ -1,0 +1,90 @@
+{% extends 'base.html' %}
+{% block title %}{{ cfg.filename }} — конфиг{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('instance_list') }}">Экземпляры</a></li>
+    <li class="breadcrumb-item">
+      <a href="{{ url_for('instance_detail', instance_id=inst.id) }}">{{ inst.win_service_name }}</a>
+    </li>
+    <li class="breadcrumb-item active">{{ cfg.filename }}</li>
+  </ol>
+</nav>
+
+<div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <h5 class="mb-0 font-monospace">{{ cfg.filename }}</h5>
+  <span class="text-muted small">{{ cfg.filepath }}</span>
+  {% if cfg.fetched_at %}
+  <span class="text-muted small">
+    <i class="bi bi-cloud-download me-1"></i>
+    Загружено: {{ cfg.fetched_at.strftime('%d.%m.%Y %H:%M') }}
+  </span>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span class="fw-semibold"><i class="bi bi-file-earmark-code me-1"></i>Содержимое файла</span>
+    <div class="d-flex gap-2 align-items-center">
+      <button type="button" class="btn btn-sm btn-outline-secondary" onclick="toggleWrap()">
+        <i class="bi bi-text-wrap"></i> Перенос
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-secondary" onclick="copyContent()">
+        <i class="bi bi-clipboard"></i> Копировать
+      </button>
+    </div>
+  </div>
+  <div class="card-body p-0">
+    <form method="post">
+      <textarea name="content" id="editor" class="config-editor form-control border-0 rounded-0"
+                spellcheck="false">{{ cfg.content or '' }}</textarea>
+      <div class="card-footer d-flex gap-2 border-top">
+        <button type="submit" class="btn btn-primary">
+          <i class="bi bi-check-lg me-1"></i>Сохранить
+        </button>
+        <a href="{{ url_for('instance_detail', instance_id=inst.id) }}"
+           class="btn btn-outline-secondary">Отмена</a>
+        <div class="ms-auto">
+          <form method="post"
+                action="{{ url_for('config_delete', instance_id=inst.id, config_id=cfg.id) }}"
+                class="d-inline"
+                onsubmit="return confirm('Удалить файл {{ cfg.filename }} из БД?')">
+            <button class="btn btn-outline-danger btn-sm">
+              <i class="bi bi-trash3 me-1"></i>Удалить
+            </button>
+          </form>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let wrapped = false;
+function toggleWrap() {
+  const el = document.getElementById('editor');
+  wrapped = !wrapped;
+  el.style.whiteSpace = wrapped ? 'pre-wrap' : 'pre';
+  el.style.overflowX = wrapped ? 'hidden' : 'auto';
+}
+function copyContent() {
+  const el = document.getElementById('editor');
+  navigator.clipboard.writeText(el.value)
+    .then(() => alert('Скопировано!'));
+}
+</script>
+<style>
+#editor {
+  white-space: pre;
+  overflow-x: auto;
+  overflow-y: auto;
+  tab-size: 4;
+  min-height: 400px;
+  max-height: 75vh;
+  resize: vertical;
+}
+</style>
+{% endblock %}

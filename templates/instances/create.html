@@ -1,0 +1,125 @@
+{% extends 'base.html' %}
+{% block title %}Добавить экземпляры{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('instance_list') }}">Экземпляры</a></li>
+    <li class="breadcrumb-item active">Добавить</li>
+  </ol>
+</nav>
+
+<div class="card">
+  <div class="card-header fw-semibold">
+    <i class="bi bi-ui-checks-grid me-1"></i>
+    Массовое добавление экземпляров
+  </div>
+  <div class="card-body">
+    <div class="alert alert-info py-2 small mb-3">
+      <i class="bi bi-info-circle me-1"></i>
+      Выберите сервис, добавьте строки «сервер + имя Windows-сервиса».
+      При добавлении автоматически определится путь к exe и конфигурационная директория
+      (<code>&lt;exe_dir&gt;\config</code>), а конфиги будут загружены в БД.
+    </div>
+
+    <form method="post" id="bulkForm">
+      {# Сервис #}
+      <div class="mb-4">
+        <label class="form-label fw-semibold">Сервис (каталог) <span class="text-danger">*</span></label>
+        {% if services %}
+        <select name="service_id" class="form-select" required style="max-width:400px;">
+          {% for svc in services %}
+          <option value="{{ svc.id }}">
+            {{ svc.display_name or svc.name }}
+            {% if svc.display_name %} ({{ svc.name }}){% endif %}
+          </option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <div class="text-danger">
+          Каталог сервисов пуст.
+          <a href="{{ url_for('service_create') }}">Добавьте сервис</a> сначала.
+        </div>
+        {% endif %}
+      </div>
+
+      {# Rows #}
+      <div class="mb-2 fw-semibold">Экземпляры</div>
+      <table class="table table-bordered align-middle mb-2" id="rowsTable">
+        <thead class="table-active">
+          <tr>
+            <th style="width:40%">Сервер</th>
+            <th>Имя Windows-сервиса</th>
+            <th style="width:40px;"></th>
+          </tr>
+        </thead>
+        <tbody id="rowsBody">
+          <tr>
+            <td>
+              <select name="server_id[]" class="form-select form-select-sm">
+                <option value="">— выберите сервер —</option>
+                {% for srv in servers %}
+                <option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environment.name }}]</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td>
+              <input type="text" name="win_service_name[]" class="form-control form-control-sm font-monospace"
+                     placeholder="MyApp.WorkerService">
+            </td>
+            <td class="text-center">
+              <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeRow(this)">
+                <i class="bi bi-x"></i>
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <button type="button" class="btn btn-sm btn-outline-secondary mb-4" onclick="addRow()">
+        <i class="bi bi-plus me-1"></i>Добавить строку
+      </button>
+
+      <div class="d-flex gap-2">
+        <button type="submit" class="btn btn-primary" {% if not services %}disabled{% endif %}>
+          <i class="bi bi-cloud-download me-1"></i>Добавить и загрузить конфиги
+        </button>
+        <a href="{{ url_for('instance_list') }}" class="btn btn-outline-secondary">Отмена</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const serverOptions = `{% for srv in servers %}<option value="{{ srv.id }}">{{ srv.hostname }} [{{ srv.environment.name }}]</option>{% endfor %}`;
+
+function addRow() {
+  const tbody = document.getElementById('rowsBody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td>
+      <select name="server_id[]" class="form-select form-select-sm">
+        <option value="">— выберите сервер —</option>
+        ${serverOptions}
+      </select>
+    </td>
+    <td>
+      <input type="text" name="win_service_name[]" class="form-control form-control-sm font-monospace"
+             placeholder="MyApp.WorkerService">
+    </td>
+    <td class="text-center">
+      <button type="button" class="btn btn-sm btn-outline-danger" onclick="removeRow(this)">
+        <i class="bi bi-x"></i>
+      </button>
+    </td>`;
+  tbody.appendChild(tr);
+}
+
+function removeRow(btn) {
+  const rows = document.querySelectorAll('#rowsBody tr');
+  if (rows.length > 1) btn.closest('tr').remove();
+}
+</script>
+{% endblock %}

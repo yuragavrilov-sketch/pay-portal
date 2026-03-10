@@ -1,0 +1,61 @@
+{% extends 'base.html' %}
+{% block title %}Каталог сервисов{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0"><i class="bi bi-box-seam me-2"></i>Каталог сервисов</h4>
+  <a href="{{ url_for('service_create') }}" class="btn btn-primary btn-sm">
+    <i class="bi bi-plus-lg me-1"></i>Добавить сервис
+  </a>
+</div>
+
+{% if services %}
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead class="table-active">
+      <tr>
+        <th>Название</th>
+        <th>Display Name</th>
+        <th>Описание</th>
+        <th class="text-center">Экземпляров</th>
+        <th>Добавлен</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for svc in services %}
+      <tr>
+        <td class="fw-semibold font-monospace">{{ svc.name }}</td>
+        <td>{{ svc.display_name or '—' }}</td>
+        <td class="text-muted">{{ svc.description or '—' }}</td>
+        <td class="text-center">
+          <a href="{{ url_for('instance_list') }}?service_id={{ svc.id }}" class="badge bg-secondary text-decoration-none">
+            {{ svc.instances | length }}
+          </a>
+        </td>
+        <td class="text-muted small">{{ svc.created_at.strftime('%d.%m.%Y') }}</td>
+        <td class="text-end">
+          <a href="{{ url_for('service_edit', service_id=svc.id) }}"
+             class="btn btn-sm btn-outline-secondary me-1">
+            <i class="bi bi-pencil"></i>
+          </a>
+          <form method="post" action="{{ url_for('service_delete', service_id=svc.id) }}"
+                class="d-inline"
+                onsubmit="return confirm('Удалить сервис «{{ svc.name }}»? Все экземпляры будут удалены.')">
+            <button class="btn btn-sm btn-outline-danger">
+              <i class="bi bi-trash3"></i>
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="text-center py-5 text-muted">
+  <i class="bi bi-box-seam fs-1 d-block mb-2"></i>
+  Каталог пуст. <a href="{{ url_for('service_create') }}">Добавить первый сервис?</a>
+</div>
+{% endif %}
+{% endblock %}
