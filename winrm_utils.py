@@ -218,3 +218,30 @@ if ($s) {{ Write-Output $s.Status }} else {{ Write-Output 'NotFound' }}
     except Exception:
         pass
     return 'unknown'
+
+
+def control_service(server, win_service_name: str, action: str) -> tuple[bool, str]:
+    """
+    Start, stop, or restart a Windows service via WinRM.
+    action: 'start' | 'stop' | 'restart'
+    Returns (success, message).
+    """
+    if not WINRM_AVAILABLE:
+        return False, "pywinrm not installed"
+    action = action.lower()
+    ps_cmd = {
+        'start':   f"Start-Service -Name '{win_service_name}' -ErrorAction Stop",
+        'stop':    f"Stop-Service  -Name '{win_service_name}' -Force -ErrorAction Stop",
+        'restart': f"Restart-Service -Name '{win_service_name}' -Force -ErrorAction Stop",
+    }.get(action)
+    if not ps_cmd:
+        return False, f"Unknown action: {action}"
+    try:
+        session = _get_session(server)
+        r = session.run_ps(ps_cmd)
+        if r.status_code == 0:
+            return True, f"Service {action}ed successfully"
+        err = r.std_err.decode(errors='replace').strip()
+        return False, err or f"Command exited with code {r.status_code}"
+    except Exception as e:
+        return False, str(e)

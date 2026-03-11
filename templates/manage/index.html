@@ -1,0 +1,406 @@
+{% extends 'base.html' %}
+{% block title %}Управление сервисами{% endblock %}
+
+{% block extra_head %}
+<style>
+.svc-tree-header {
+  background: var(--bs-secondary-bg);
+  border-radius: 8px;
+  padding: .6rem 1rem;
+  cursor: pointer;
+  user-select: none;
+}
+.svc-tree-header:hover { background: var(--bs-tertiary-bg); }
+.svc-tree-body { padding-left: 1.5rem; }
+.inst-row { border-left: 3px solid var(--bs-border-color); padding-left: .75rem; }
+.inst-row:hover { border-left-color: var(--bs-primary); }
+.ctrl-btn { min-width: 90px; }
+.snap-badge { cursor: pointer; }
+.spin { animation: spin .8s linear infinite; display:inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+/* Snapshot modal table */
+#snapModalTable td { font-size: .82rem; }
+#snapModalTable td.content-cell { font-family: monospace; white-space: pre; max-height: 200px; overflow: auto; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">
+    <i class="bi bi-toggles me-2"></i>Управление сервисами
+    {% if current_env %}
+    <span class="badge bg-primary fs-6 ms-1">{{ current_env.name }}</span>
+    {% endif %}
+  </h4>
+  <button class="btn btn-sm btn-outline-secondary" onclick="refreshAllStatuses()">
+    <i class="bi bi-arrow-clockwise me-1"></i>Обновить статусы
+  </button>
+</div>
+
+{% if not service_groups %}
+<div class="text-center py-5 text-muted">
+  <i class="bi bi-toggles fs-1 d-block mb-2"></i>
+  Нет экземпляров сервисов.
+  <a href="{{ url_for('instance_create') }}">Добавить?</a>
+</div>
+{% endif %}
+
+{% for group in service_groups %}
+{% set svc = group.service %}
+{% set insts = group.instances %}
+<div class="mb-3" id="svc-block-{{ svc.id }}">
+
+  {# Service header row #}
+  <div class="svc-tree-header d-flex align-items-center gap-2"
+       data-bs-toggle="collapse" data-bs-target="#svc-body-{{ svc.id }}"
+       aria-expanded="true">
+    <i class="bi bi-chevron-down svc-chevron me-1"></i>
+    <span class="fw-semibold">{{ svc.display_name or svc.name }}</span>
+    <span class="badge bg-secondary">{{ svc.name }}</span>
+    <span class="badge bg-dark ms-1">{{ insts | length }} экз.</span>
+    <span class="ms-auto"></span>
+
+    {# Bulk control buttons — stop propagation so collapse doesn't toggle #}
+    <button class="btn btn-sm btn-outline-success ctrl-btn"
+            onclick="event.stopPropagation(); ctrlService({{ svc.id }}, 'start')"
+            title="Запустить все экземпляры">
+      <i class="bi bi-play-fill me-1"></i>Запустить
+    </button>
+    <button class="btn btn-sm btn-outline-danger ctrl-btn"
+            onclick="event.stopPropagation(); ctrlService({{ svc.id }}, 'stop')"
+            title="Остановить все экземпляры">
+      <i class="bi bi-stop-fill me-1"></i>Стоп
+    </button>
+    <button class="btn btn-sm btn-outline-warning ctrl-btn"
+            onclick="event.stopPropagation(); ctrlService({{ svc.id }}, 'restart')"
+            title="Перезапустить все экземпляры">
+      <i class="bi bi-arrow-repeat me-1"></i>Рестарт
+    </button>
+    <span id="svc-spinner-{{ svc.id }}" class="d-none ms-1">
+      <span class="spinner-border spinner-border-sm text-secondary"></span>
+    </span>
+  </div>
+
+  {# Collapse body — instances tree #}
+  <div class="collapse show svc-tree-body" id="svc-body-{{ svc.id }}">
+    {% for inst in insts %}
+    <div class="inst-row d-flex align-items-center gap-2 py-2 mt-1 rounded"
+         id="inst-row-{{ inst.id }}">
+
+      <i class="bi bi-server text-muted"></i>
+      <span class="font-monospace fw-semibold">{{ inst.win_service_name }}</span>
+      <span class="text-muted small">@{{ inst.server.hostname }}</span>
+      {% for env in inst.server.environments %}
+      <span class="badge bg-secondary env-badge">{{ env.name }}</span>
+      {% endfor %}
+
+      {# Status badge #}
+      {% set st = inst.status | lower %}
+      <span id="status-{{ inst.id }}" class="badge ms-1
+        {% if st == 'running' %}bg-success
+        {% elif st == 'stopped' %}bg-danger
+        {% elif st in ('starting', 'stop pending') %}bg-warning text-dark
+        {% else %}bg-secondary{% endif %}">
+        {{ inst.status }}
+      </span>
+
+      <span class="ms-auto"></span>
+
+      {# Snapshot badge #}
+      <button class="btn btn-sm btn-outline-secondary snap-badge"
+              onclick="showSnapshots({{ inst.id }}, '{{ inst.win_service_name }}')"
+              id="snap-btn-{{ inst.id }}"
+              title="Снэпшоты конфигурации">
+        <i class="bi bi-camera"></i>
+        <span id="snap-count-{{ inst.id }}" class="badge bg-secondary ms-1 snap-count"
+              data-loaded="false">…</span>
+      </button>
+
+      {# Refresh status #}
+      <button class="btn btn-sm btn-outline-info" onclick="refreshStatus({{ inst.id }})"
+              title="Обновить статус">
+        <i class="bi bi-arrow-clockwise" id="spin-{{ inst.id }}"></i>
+      </button>
+
+      {# Instance control buttons #}
+      <button class="btn btn-sm btn-success"
+              onclick="ctrlInstance({{ inst.id }}, 'start')" title="Запустить">
+        <i class="bi bi-play-fill"></i>
+      </button>
+      <button class="btn btn-sm btn-danger"
+              onclick="ctrlInstance({{ inst.id }}, 'stop')" title="Остановить">
+        <i class="bi bi-stop-fill"></i>
+      </button>
+      <button class="btn btn-sm btn-warning"
+              onclick="ctrlInstance({{ inst.id }}, 'restart')" title="Перезапустить">
+        <i class="bi bi-arrow-repeat"></i>
+      </button>
+
+      {# Detail link #}
+      <a href="{{ url_for('instance_detail', instance_id=inst.id) }}"
+         class="btn btn-sm btn-outline-secondary" title="Детали">
+        <i class="bi bi-eye"></i>
+      </a>
+
+    </div>
+    {% endfor %}
+  </div>
+
+</div>
+{% endfor %}
+
+{# ── Snapshot modal ─────────────────────────────────────────────── #}
+<div class="modal fade" id="snapshotModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">
+          <i class="bi bi-camera me-2"></i>Снэпшоты:
+          <span id="snapModalTitle"></span>
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <div id="snapListContainer" class="p-3">
+          <p class="text-muted">Загрузка…</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ── Config view modal ──────────────────────────────────────────── #}
+<div class="modal fade" id="snapDetailModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">
+          <i class="bi bi-file-earmark-text me-2"></i>Снэпшот #<span id="snapDetailId"></span>
+          — <span id="snapDetailTitle"></span>
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="snapDetailBody">
+        <p class="text-muted">Загрузка…</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+
+{% block extra_js %}
+<script>
+// ── Helpers ─────────────────────────────────────────────────────────
+function statusClass(st) {
+  st = (st||'').toLowerCase();
+  return st === 'running' ? 'bg-success' :
+         st === 'stopped' ? 'bg-danger' :
+         ['starting','stop pending'].includes(st) ? 'bg-warning text-dark' :
+         'bg-secondary';
+}
+
+function setStatus(id, status) {
+  const b = document.getElementById('status-' + id);
+  if (!b) return;
+  b.textContent = status;
+  b.className = 'badge ms-1 ' + statusClass(status);
+}
+
+function toast(msg, isError) {
+  // Simple inline flash using a floating alert
+  const d = document.createElement('div');
+  d.className = `alert alert-${isError ? 'danger' : 'success'} alert-dismissible fade show position-fixed bottom-0 end-0 m-3`;
+  d.style.zIndex = 9999;
+  d.innerHTML = msg + '<button type="button" class="btn-close" data-bs-dismiss="alert"></button>';
+  document.body.appendChild(d);
+  setTimeout(() => d.remove(), 5000);
+}
+
+// ── Refresh single status ────────────────────────────────────────────
+async function refreshStatus(id) {
+  const icon = document.getElementById('spin-' + id);
+  icon.classList.add('spin');
+  try {
+    const r = await fetch(`/instances/${id}/refresh-status`, {method:'POST'});
+    const d = await r.json();
+    setStatus(id, d.status);
+  } catch(e) {
+    toast('Ошибка обновления статуса', true);
+  } finally {
+    icon.classList.remove('spin');
+  }
+}
+
+// ── Refresh all statuses on page ─────────────────────────────────────
+async function refreshAllStatuses() {
+  const ids = [...document.querySelectorAll('[id^="status-"]')]
+    .map(el => el.id.replace('status-', ''));
+  await Promise.all(ids.map(id => refreshStatus(Number(id))));
+}
+
+// ── Control single instance ──────────────────────────────────────────
+async function ctrlInstance(id, action) {
+  const labels = {start:'Запустить', stop:'Остановить', restart:'Перезапустить'};
+  if (!confirm(`${labels[action]} экземпляр?`)) return;
+  const btns = document.querySelectorAll(`#inst-row-${id} button`);
+  btns.forEach(b => b.disabled = true);
+  try {
+    const r = await fetch(`/manage/instances/${id}/control`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action}),
+    });
+    const d = await r.json();
+    setStatus(id, d.status);
+    // Invalidate snapshot count cache
+    const cnt = document.getElementById('snap-count-' + id);
+    if (cnt) { cnt.textContent = '…'; cnt.dataset.loaded = 'false'; }
+    toast(d.ok ? `✓ ${d.message}` : `✗ ${d.message}`, !d.ok);
+  } catch(e) {
+    toast('Ошибка запроса', true);
+  } finally {
+    btns.forEach(b => b.disabled = false);
+  }
+}
+
+// ── Bulk control for whole service ───────────────────────────────────
+async function ctrlService(serviceId, action) {
+  const labels = {start:'Запустить ВСЕ', stop:'Остановить ВСЕ', restart:'Перезапустить ВСЕ'};
+  if (!confirm(`${labels[action]} экземпляры сервиса?`)) return;
+  const spinner = document.getElementById('svc-spinner-' + serviceId);
+  if (spinner) spinner.classList.remove('d-none');
+  try {
+    const r = await fetch(`/manage/services/${serviceId}/control`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action}),
+    });
+    const d = await r.json();
+    (d.results || []).forEach(res => {
+      setStatus(res.instance_id, res.status);
+      // Invalidate snapshot count cache
+      const cnt = document.getElementById('snap-count-' + res.instance_id);
+      if (cnt) { cnt.textContent = '…'; cnt.dataset.loaded = 'false'; }
+    });
+    const ok = d.results ? d.results.every(r => r.ok) : d.ok;
+    const okCount = d.results ? d.results.filter(r => r.ok).length : (d.ok ? 1 : 0);
+    toast(ok ? `✓ Все операции выполнены (${okCount})` :
+               `⚠ Выполнено ${okCount} из ${d.results.length}`, !ok);
+  } catch(e) {
+    toast('Ошибка запроса', true);
+  } finally {
+    if (spinner) spinner.classList.add('d-none');
+  }
+}
+
+// ── Snapshots modal ──────────────────────────────────────────────────
+const snapModal = new bootstrap.Modal(document.getElementById('snapshotModal'));
+const snapDetailModal = new bootstrap.Modal(document.getElementById('snapDetailModal'));
+
+async function showSnapshots(instId, name) {
+  document.getElementById('snapModalTitle').textContent = name;
+  document.getElementById('snapListContainer').innerHTML = '<p class="text-muted">Загрузка…</p>';
+  snapModal.show();
+
+  const r = await fetch(`/manage/instances/${instId}/snapshots`);
+  const d = await r.json();
+  const cnt = document.getElementById('snap-count-' + instId);
+  if (cnt) { cnt.textContent = d.snapshots.length; cnt.dataset.loaded = 'true'; }
+
+  if (!d.snapshots.length) {
+    document.getElementById('snapListContainer').innerHTML =
+      '<p class="text-muted p-3">Снэпшотов нет.</p>';
+    return;
+  }
+
+  const rows = d.snapshots.map(s => `
+    <tr>
+      <td>${s.id}</td>
+      <td><span class="badge ${s.trigger==='start'?'bg-success':s.trigger==='stop'?'bg-danger':'bg-warning text-dark'}">${s.trigger}</span></td>
+      <td>${s.created_at}</td>
+      <td class="text-center">${s.files}</td>
+      <td>
+        <button class="btn btn-sm btn-outline-secondary"
+                onclick="showSnapshotDetail(${s.id}, '${name}')">
+          <i class="bi bi-eye"></i> Просмотр
+        </button>
+      </td>
+    </tr>`).join('');
+
+  document.getElementById('snapListContainer').innerHTML = `
+    <table class="table table-hover table-sm mb-0" id="snapModalTable">
+      <thead class="table-active">
+        <tr><th>#</th><th>Операция</th><th>Дата</th><th class="text-center">Файлов</th><th></th></tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function showSnapshotDetail(snapId, name) {
+  document.getElementById('snapDetailId').textContent = snapId;
+  document.getElementById('snapDetailTitle').textContent = name;
+  document.getElementById('snapDetailBody').innerHTML = '<p class="text-muted">Загрузка…</p>';
+  snapDetailModal.show();
+
+  const r = await fetch(`/manage/snapshots/${snapId}`);
+  const d = await r.json();
+
+  if (!d.configs || !d.configs.length) {
+    document.getElementById('snapDetailBody').innerHTML =
+      '<p class="text-muted">Конфигурационные файлы не были сохранены.</p>';
+    return;
+  }
+
+  const accordion = d.configs.map((cfg, i) => `
+    <div class="accordion-item">
+      <h2 class="accordion-header">
+        <button class="accordion-button collapsed" type="button"
+                data-bs-toggle="collapse" data-bs-target="#snapCfg-${snapId}-${i}">
+          <i class="bi bi-file-earmark-text me-2"></i>
+          <span class="font-monospace">${cfg.filename}</span>
+          <small class="text-muted ms-2">${cfg.filepath}</small>
+        </button>
+      </h2>
+      <div id="snapCfg-${snapId}-${i}" class="accordion-collapse collapse">
+        <div class="accordion-body p-0">
+          <pre class="m-0 p-3" style="max-height:400px;overflow:auto;font-size:.8rem;">${escHtml(cfg.content || '')}</pre>
+        </div>
+      </div>
+    </div>`).join('');
+
+  document.getElementById('snapDetailBody').innerHTML =
+    `<div class="accordion">${accordion}</div>`;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Chevron animation for collapse ──────────────────────────────────
+document.querySelectorAll('[data-bs-toggle="collapse"]').forEach(btn => {
+  const target = document.querySelector(btn.dataset.bsTarget);
+  if (!target) return;
+  target.addEventListener('show.bs.collapse', () => {
+    btn.querySelector('.svc-chevron').style.transform = 'rotate(0deg)';
+  });
+  target.addEventListener('hide.bs.collapse', () => {
+    btn.querySelector('.svc-chevron').style.transform = 'rotate(-90deg)';
+  });
+});
+
+// ── Load snapshot counts on page load ───────────────────────────────
+(async function loadSnapCounts() {
+  const btns = document.querySelectorAll('[id^="snap-btn-"]');
+  await Promise.all([...btns].map(async btn => {
+    const id = btn.id.replace('snap-btn-', '');
+    try {
+      const r = await fetch(`/manage/instances/${id}/snapshots`);
+      const d = await r.json();
+      const cnt = document.getElementById('snap-count-' + id);
+      if (cnt) cnt.textContent = d.snapshots.length;
+    } catch {}
+  }));
+})();
+</script>
+{% endblock %}

@@ -138,6 +138,26 @@ class InstanceConfig(db.Model):
         return f'<InstanceConfig {self.filename} instance={self.instance_id}>'
 
 
+class ConfigSnapshot(db.Model):
+    """
+    Снэпшот конфигурационных файлов экземпляра сервиса,
+    снятый перед операцией управления (start/stop/restart).
+    """
+    __tablename__ = 'config_snapshots'
+
+    id           = db.Column(db.Integer, primary_key=True)
+    instance_id  = db.Column(db.Integer, db.ForeignKey('service_instances.id'), nullable=False)
+    trigger      = db.Column(db.String(32))   # start / stop / restart
+    configs_json = db.Column(db.Text)         # JSON: [{filename, filepath, content}]
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    instance = db.relationship('ServiceInstance',
+                               backref=db.backref('snapshots', cascade='all, delete-orphan'))
+
+    def __repr__(self):
+        return f'<ConfigSnapshot instance={self.instance_id} trigger={self.trigger}>'
+
+
 class AuditLog(db.Model):
     """
     Журнал действий пользователя.
@@ -152,6 +172,8 @@ class AuditLog(db.Model):
     ACTION_TEST_CONN       = 'test_connection'
     ACTION_REFRESH_STATUS  = 'refresh_status'
     ACTION_REFRESH_CONFIGS = 'refresh_configs'
+    ACTION_CONTROL         = 'control'
+    ACTION_SNAPSHOT        = 'snapshot'
 
     # Типы сущностей
     ENTITY_ENVIRONMENT = 'environment'
@@ -160,6 +182,7 @@ class AuditLog(db.Model):
     ENTITY_SERVICE     = 'service'
     ENTITY_INSTANCE    = 'instance'
     ENTITY_CONFIG      = 'config'
+    ENTITY_SNAPSHOT    = 'snapshot'
 
     # Результат
     RESULT_OK      = 'ok'

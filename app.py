@@ -1,4 +1,5 @@
 """Service Management Portal — Flask application."""
+import json
 import logging
 import os
 from datetime import datetime
@@ -10,7 +11,7 @@ from flask import (
     Flask, render_template, redirect, url_for, request,
     flash, session, jsonify,
 )
-from models import db, AuditLog, Environment, Credential, Server, Service, ServiceInstance, InstanceConfig
+from models import db, AuditLog, ConfigSnapshot, Environment, Credential, Server, Service, ServiceInstance, InstanceConfig
 from logger import setup_logging
 import winrm_utils
 
@@ -559,6 +560,135 @@ def create_app():
                config_id, filename, details=f'instance={inst_name}')
         flash('Файл конфига удалён.', 'success')
         return redirect(url_for('instance_detail', instance_id=instance_id))
+
+    # ==================================================================
+    # Service Management (tree view + control)
+    # ==================================================================
+
+    def _take_snapshot(inst, trigger: str) -> ConfigSnapshot:
+        """Create and persist a config snapshot for an instance before a control operation."""
+        configs_data = [
+            {'filename': c.filename, 'filepath': c.filepath, 'content': c.content}
+            for c in inst.configs
+        ]
+        snap = ConfigSnapshot(
+            instance_id=inst.id,
+            trigger=trigger,
+            configs_json=json.dumps(configs_data, ensure_ascii=False),
+        )
+        db.session.add(snap)
+        _audit(AuditLog.ACTION_SNAPSHOT, AuditLog.ENTITY_SNAPSHOT,
+               inst.id, inst.win_service_name,
+               details=f'trigger={trigger} server={inst.server.hostname} files={len(configs_data)}')
+        return snap
+
+    @app.route('/manage')
+    def manage_index():
+        current_env_id = session.get('current_env_id')
+        query = ServiceInstance.query.join(Server)
+        if current_env_id:
+            query = query.join(Server.environments).filter(Environment.id == current_env_id)
+        instances = query.order_by(ServiceInstance.service_id, Server.hostname,
+                                   ServiceInstance.win_service_name).all()
+
+        # Group by service
+        services_map: dict = {}
+        for inst in instances:
+            sid = inst.service_id
+            if sid not in services_map:
+                services_map[sid] = {'service': inst.service, 'instances': []}
+            services_map[sid]['instances'].append(inst)
+
+        service_groups = list(services_map.values())
+        return render_template('manage/index.html', service_groups=service_groups)
+
+    @app.route('/manage/instances/<int:instance_id>/control', methods=['POST'])
+    def manage_instance_control(instance_id):
+        inst = ServiceInstance.query.get_or_404(instance_id)
+        action = request.json.get('action', '') if request.is_json else request.form.get('action', '')
+        if action not in ('start', 'stop', 'restart'):
+            return jsonify({'ok': False, 'error': 'Invalid action'}), 400
+
+        # Snapshot before action
+        snap = _take_snapshot(inst, action)
+        db.session.flush()
+        snap_id = snap.id
+
+        ok, msg = winrm_utils.control_service(inst.server, inst.win_service_name, action)
+
+        # Refresh status after action
+        new_status = winrm_utils.get_service_status(inst.server, inst.win_service_name)
+        inst.status = new_status
+        inst.last_status_check = datetime.utcnow()
+        db.session.commit()
+
+        _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
+               inst.id, inst.win_service_name,
+               details=f'action={action} server={inst.server.hostname} result={msg} status={new_status}',
+               result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR)
+
+        return jsonify({'ok': ok, 'message': msg, 'status': new_status, 'snapshot_id': snap_id})
+
+    @app.route('/manage/services/<int:service_id>/control', methods=['POST'])
+    def manage_service_control(service_id):
+        svc = Service.query.get_or_404(service_id)
+        action = request.json.get('action', '') if request.is_json else request.form.get('action', '')
+        if action not in ('start', 'stop', 'restart'):
+            return jsonify({'ok': False, 'error': 'Invalid action'}), 400
+
+        current_env_id = session.get('current_env_id')
+        query = ServiceInstance.query.filter_by(service_id=service_id).join(Server)
+        if current_env_id:
+            query = query.join(Server.environments).filter(Environment.id == current_env_id)
+        instances = query.all()
+
+        results = []
+        for inst in instances:
+            snap = _take_snapshot(inst, action)
+            db.session.flush()
+            ok, msg = winrm_utils.control_service(inst.server, inst.win_service_name, action)
+            new_status = winrm_utils.get_service_status(inst.server, inst.win_service_name)
+            inst.status = new_status
+            inst.last_status_check = datetime.utcnow()
+            _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
+                   inst.id, inst.win_service_name,
+                   details=f'action={action} bulk=service#{service_id} server={inst.server.hostname} result={msg} status={new_status}',
+                   result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR)
+            results.append({'instance_id': inst.id, 'ok': ok, 'message': msg,
+                            'status': new_status, 'snapshot_id': snap.id})
+
+        db.session.commit()
+        all_ok = all(r['ok'] for r in results)
+        return jsonify({'ok': all_ok, 'service': svc.name, 'results': results})
+
+    @app.route('/manage/instances/<int:instance_id>/snapshots')
+    def manage_instance_snapshots(instance_id):
+        inst = ServiceInstance.query.get_or_404(instance_id)
+        snaps = (ConfigSnapshot.query
+                 .filter_by(instance_id=instance_id)
+                 .order_by(ConfigSnapshot.created_at.desc())
+                 .limit(20).all())
+        data = []
+        for s in snaps:
+            data.append({
+                'id': s.id,
+                'trigger': s.trigger,
+                'created_at': s.created_at.strftime('%d.%m.%Y %H:%M:%S'),
+                'files': len(json.loads(s.configs_json or '[]')),
+            })
+        return jsonify({'instance': inst.win_service_name, 'snapshots': data})
+
+    @app.route('/manage/snapshots/<int:snapshot_id>')
+    def manage_snapshot_detail(snapshot_id):
+        snap = ConfigSnapshot.query.get_or_404(snapshot_id)
+        configs = json.loads(snap.configs_json or '[]')
+        return jsonify({
+            'id': snap.id,
+            'instance_id': snap.instance_id,
+            'trigger': snap.trigger,
+            'created_at': snap.created_at.strftime('%d.%m.%Y %H:%M:%S'),
+            'configs': configs,
+        })
 
     # ==================================================================
     # Audit journal

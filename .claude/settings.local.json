@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from app import create_app; print\\(''OK''\\)\")",
+      "Bash(python -c \"from models import ConfigSnapshot, AuditLog; print\\(''Snapshot:'', ConfigSnapshot.__tablename__\\); print\\(''Actions:'', AuditLog.ACTION_CONTROL, AuditLog.ACTION_SNAPSHOT\\)\")"
+    ]
+  }
+}

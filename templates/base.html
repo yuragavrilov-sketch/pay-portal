@@ -108,6 +108,12 @@
             <i class="bi bi-ui-checks-grid"></i> Экземпляры
           </a>
         </li>
+        <li class="nav-item">
+          <a class="nav-link {% if request.endpoint and request.endpoint.startswith('manage') %}active{% endif %}"
+             href="{{ url_for('manage_index') }}">
+            <i class="bi bi-toggles"></i> Управление
+          </a>
+        </li>
         <li class="mt-3">
           <div class="small text-uppercase text-muted fw-semibold px-2 mb-2">Справочники</div>
         </li>
