@@ -103,6 +103,7 @@
         {% else %}bg-secondary{% endif %}">
         {{ inst.status }}
       </span>
+      <span id="progress-{{ inst.id }}" class="text-info small fst-italic d-none ms-1"></span>
 
       <span class="ms-auto"></span>
 
@@ -191,11 +192,11 @@
 
 {% block extra_js %}
 <script>
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────
 function statusClass(st) {
-  st = (st||'').toLowerCase();
-  return st === 'running' ? 'bg-success' :
-         st === 'stopped' ? 'bg-danger' :
+  st = (st || '').toLowerCase();
+  return st === 'running'  ? 'bg-success' :
+         st === 'stopped'  ? 'bg-danger'  :
          ['starting','stop pending'].includes(st) ? 'bg-warning text-dark' :
          'bg-secondary';
 }
@@ -207,91 +208,159 @@ function setStatus(id, status) {
   b.className = 'badge ms-1 ' + statusClass(status);
 }
 
+function setProgress(id, msg) {
+  const el = document.getElementById('progress-' + id);
+  if (!el) return;
+  if (msg) { el.textContent = msg; el.classList.remove('d-none'); }
+  else     { el.textContent = '';  el.classList.add('d-none'); }
+}
+
+function invalidateSnapCount(id) {
+  const cnt = document.getElementById('snap-count-' + id);
+  if (cnt) { cnt.textContent = '…'; cnt.dataset.loaded = 'false'; }
+}
+
 function toast(msg, isError) {
-  // Simple inline flash using a floating alert
   const d = document.createElement('div');
-  d.className = `alert alert-${isError ? 'danger' : 'success'} alert-dismissible fade show position-fixed bottom-0 end-0 m-3`;
+  d.className = `alert alert-${isError ? 'danger' : 'success'} alert-dismissible fade show
+                 position-fixed bottom-0 end-0 m-3`;
   d.style.zIndex = 9999;
   d.innerHTML = msg + '<button type="button" class="btn-close" data-bs-dismiss="alert"></button>';
   document.body.appendChild(d);
-  setTimeout(() => d.remove(), 5000);
+  setTimeout(() => d.remove(), 6000);
 }
 
-// ── Refresh single status ────────────────────────────────────────────
+// ── SSE subscriber ────────────────────────────────────────────────────
+function subscribeTask(taskId, onEvent, onError) {
+  const es = new EventSource(`/manage/tasks/${taskId}/stream`);
+  es.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === 'heartbeat') return;
+    onEvent(data, es);
+  };
+  es.onerror = () => { es.close(); onError(); };
+  return es;
+}
+
+// ── Refresh single status ─────────────────────────────────────────────
 async function refreshStatus(id) {
   const icon = document.getElementById('spin-' + id);
   icon.classList.add('spin');
   try {
-    const r = await fetch(`/instances/${id}/refresh-status`, {method:'POST'});
+    const r = await fetch(`/instances/${id}/refresh-status`, {method: 'POST'});
     const d = await r.json();
     setStatus(id, d.status);
-  } catch(e) {
-    toast('Ошибка обновления статуса', true);
-  } finally {
-    icon.classList.remove('spin');
-  }
+  } catch { toast('Ошибка обновления статуса', true); }
+  finally  { icon.classList.remove('spin'); }
 }
 
-// ── Refresh all statuses on page ─────────────────────────────────────
 async function refreshAllStatuses() {
   const ids = [...document.querySelectorAll('[id^="status-"]')]
     .map(el => el.id.replace('status-', ''));
   await Promise.all(ids.map(id => refreshStatus(Number(id))));
 }
 
-// ── Control single instance ──────────────────────────────────────────
+// ── Control single instance ───────────────────────────────────────────
 async function ctrlInstance(id, action) {
-  const labels = {start:'Запустить', stop:'Остановить', restart:'Перезапустить'};
+  const labels = {start: 'Запустить', stop: 'Остановить', restart: 'Перезапустить'};
   if (!confirm(`${labels[action]} экземпляр?`)) return;
-  const btns = document.querySelectorAll(`#inst-row-${id} button`);
-  btns.forEach(b => b.disabled = true);
+
+  const rowBtns = document.querySelectorAll(`#inst-row-${id} button`);
+  rowBtns.forEach(b => b.disabled = true);
+  setProgress(id, 'Инициализация…');
+
+  let taskId;
   try {
     const r = await fetch(`/manage/instances/${id}/control`, {
-      method: 'POST',
+      method:  'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action}),
+      body:    JSON.stringify({action}),
     });
-    const d = await r.json();
-    setStatus(id, d.status);
-    // Invalidate snapshot count cache
-    const cnt = document.getElementById('snap-count-' + id);
-    if (cnt) { cnt.textContent = '…'; cnt.dataset.loaded = 'false'; }
-    toast(d.ok ? `✓ ${d.message}` : `✗ ${d.message}`, !d.ok);
-  } catch(e) {
-    toast('Ошибка запроса', true);
-  } finally {
-    btns.forEach(b => b.disabled = false);
+    ({task_id: taskId} = await r.json());
+  } catch {
+    toast('Ошибка отправки запроса', true);
+    rowBtns.forEach(b => b.disabled = false);
+    setProgress(id, '');
+    return;
   }
+
+  subscribeTask(taskId,
+    (data, es) => {
+      if (data.type === 'progress') {
+        setProgress(data.instance_id, data.message);
+      } else if (data.type === 'done') {
+        es.close();
+        setProgress(data.instance_id, '');
+        rowBtns.forEach(b => b.disabled = false);
+        setStatus(data.instance_id, data.status);
+        invalidateSnapCount(data.instance_id);
+        toast(data.ok ? `✓ ${data.message}` : `✗ ${data.message}`, !data.ok);
+      }
+    },
+    () => {
+      setProgress(id, '');
+      rowBtns.forEach(b => b.disabled = false);
+      toast('Соединение прервано', true);
+    }
+  );
 }
 
-// ── Bulk control for whole service ───────────────────────────────────
+// ── Bulk control for whole service ────────────────────────────────────
 async function ctrlService(serviceId, action) {
-  const labels = {start:'Запустить ВСЕ', stop:'Остановить ВСЕ', restart:'Перезапустить ВСЕ'};
+  const labels = {start: 'Запустить ВСЕ', stop: 'Остановить ВСЕ', restart: 'Перезапустить ВСЕ'};
   if (!confirm(`${labels[action]} экземпляры сервиса?`)) return;
-  const spinner = document.getElementById('svc-spinner-' + serviceId);
+
+  const svcBlock  = document.getElementById('svc-block-' + serviceId);
+  const allBtns   = svcBlock ? svcBlock.querySelectorAll('button') : [];
+  const spinner   = document.getElementById('svc-spinner-' + serviceId);
+  allBtns.forEach(b => b.disabled = true);
   if (spinner) spinner.classList.remove('d-none');
+
+  let taskId;
   try {
     const r = await fetch(`/manage/services/${serviceId}/control`, {
-      method: 'POST',
+      method:  'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action}),
+      body:    JSON.stringify({action}),
     });
-    const d = await r.json();
-    (d.results || []).forEach(res => {
-      setStatus(res.instance_id, res.status);
-      // Invalidate snapshot count cache
-      const cnt = document.getElementById('snap-count-' + res.instance_id);
-      if (cnt) { cnt.textContent = '…'; cnt.dataset.loaded = 'false'; }
-    });
-    const ok = d.results ? d.results.every(r => r.ok) : d.ok;
-    const okCount = d.results ? d.results.filter(r => r.ok).length : (d.ok ? 1 : 0);
-    toast(ok ? `✓ Все операции выполнены (${okCount})` :
-               `⚠ Выполнено ${okCount} из ${d.results.length}`, !ok);
-  } catch(e) {
-    toast('Ошибка запроса', true);
-  } finally {
+    ({task_id: taskId} = await r.json());
+  } catch {
+    toast('Ошибка отправки запроса', true);
+    allBtns.forEach(b => b.disabled = false);
     if (spinner) spinner.classList.add('d-none');
+    return;
   }
+
+  subscribeTask(taskId,
+    (data, es) => {
+      if (data.type === 'progress') {
+        if (data.instance_id) setProgress(data.instance_id, data.message);
+      } else if (data.type === 'instance_done') {
+        setStatus(data.instance_id, data.status);
+        setProgress(data.instance_id, '');
+        invalidateSnapCount(data.instance_id);
+      } else if (data.type === 'done_all') {
+        es.close();
+        allBtns.forEach(b => b.disabled = false);
+        if (spinner) spinner.classList.add('d-none');
+        (data.results || []).forEach(res => {
+          setStatus(res.instance_id, res.status);
+          setProgress(res.instance_id, '');
+          invalidateSnapCount(res.instance_id);
+        });
+        const okCount = (data.results || []).filter(r => r.ok).length;
+        const total   = (data.results || []).length;
+        toast(data.ok
+          ? `✓ Все операции выполнены (${okCount})`
+          : `⚠ Выполнено ${okCount} из ${total}`, !data.ok);
+      }
+    },
+    () => {
+      allBtns.forEach(b => b.disabled = false);
+      if (spinner) spinner.classList.add('d-none');
+      toast('Соединение прервано', true);
+    }
+  );
 }
 
 // ── Snapshots modal ──────────────────────────────────────────────────

@@ -2,6 +2,9 @@
 import json
 import logging
 import os
+import queue
+import threading
+import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -9,7 +12,7 @@ load_dotenv()  # загружает .env до инициализации при�
 
 from flask import (
     Flask, render_template, redirect, url_for, request,
-    flash, session, jsonify,
+    flash, session, jsonify, Response, stream_with_context,
 )
 from models import db, AuditLog, ConfigSnapshot, Environment, Credential, Server, Service, ServiceInstance, InstanceConfig
 from logger import setup_logging
@@ -29,16 +32,23 @@ def _audit(
     entity_name: str = '',
     details: str = '',
     result: str = AuditLog.RESULT_OK,
+    _ip: str | None = None,
 ):
     """
     Writes one row to audit_log + emits a Python log line.
-    Safe to call inside a request context; silently skips on error.
+    Safe to call inside a request context or a background thread (_ip must be
+    passed explicitly when called outside a request context).
     """
     try:
-        ip = (
-            request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
-            or request.remote_addr
-        )
+        if _ip is None:
+            try:
+                _ip = (
+                    request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                    or request.remote_addr
+                )
+            except RuntimeError:
+                _ip = 'system'
+        ip = _ip
         entry = AuditLog(
             action=action,
             entity_type=entity_type,
@@ -562,11 +572,14 @@ def create_app():
         return redirect(url_for('instance_detail', instance_id=instance_id))
 
     # ==================================================================
-    # Service Management (tree view + control)
+    # Service Management (tree view + SSE control)
     # ==================================================================
 
-    def _take_snapshot(inst, trigger: str) -> ConfigSnapshot:
-        """Create and persist a config snapshot for an instance before a control operation."""
+    # In-memory task registry: task_id -> {'q': Queue, 'done': bool}
+    _tasks: dict = {}
+
+    def _take_snapshot(inst, trigger: str, _ip: str = 'system') -> ConfigSnapshot:
+        """Create and persist a config snapshot before a control operation."""
         configs_data = [
             {'filename': c.filename, 'filepath': c.filepath, 'content': c.content}
             for c in inst.configs
@@ -579,7 +592,8 @@ def create_app():
         db.session.add(snap)
         _audit(AuditLog.ACTION_SNAPSHOT, AuditLog.ENTITY_SNAPSHOT,
                inst.id, inst.win_service_name,
-               details=f'trigger={trigger} server={inst.server.hostname} files={len(configs_data)}')
+               details=f'trigger={trigger} server={inst.server.hostname} files={len(configs_data)}',
+               _ip=_ip)
         return snap
 
     @app.route('/manage')
@@ -591,7 +605,6 @@ def create_app():
         instances = query.order_by(ServiceInstance.service_id, Server.hostname,
                                    ServiceInstance.win_service_name).all()
 
-        # Group by service
         services_map: dict = {}
         for inst in instances:
             sid = inst.service_id
@@ -599,9 +612,41 @@ def create_app():
                 services_map[sid] = {'service': inst.service, 'instances': []}
             services_map[sid]['instances'].append(inst)
 
-        service_groups = list(services_map.values())
-        return render_template('manage/index.html', service_groups=service_groups)
+        return render_template('manage/index.html', service_groups=list(services_map.values()))
 
+    # ------------------------------------------------------------------
+    # SSE task stream
+    # ------------------------------------------------------------------
+    @app.route('/manage/tasks/<task_id>/stream')
+    def manage_task_stream(task_id):
+        task = _tasks.get(task_id)
+        if not task:
+            return jsonify({'error': 'Task not found'}), 404
+
+        def generate():
+            q = task['q']
+            while True:
+                try:
+                    event = q.get(timeout=30)
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if event.get('type') in ('done', 'done_all'):
+                        break
+                except queue.Empty:
+                    yield 'data: {"type":"heartbeat"}\n\n'
+                    if task.get('done'):
+                        break
+            _tasks.pop(task_id, None)
+
+        return Response(
+            stream_with_context(generate()),
+            content_type='text/event-stream',
+            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no',
+                     'Connection': 'keep-alive'},
+        )
+
+    # ------------------------------------------------------------------
+    # Control single instance  →  POST returns task_id immediately
+    # ------------------------------------------------------------------
     @app.route('/manage/instances/<int:instance_id>/control', methods=['POST'])
     def manage_instance_control(instance_id):
         inst = ServiceInstance.query.get_or_404(instance_id)
@@ -609,26 +654,59 @@ def create_app():
         if action not in ('start', 'stop', 'restart'):
             return jsonify({'ok': False, 'error': 'Invalid action'}), 400
 
-        # Snapshot before action
-        snap = _take_snapshot(inst, action)
-        db.session.flush()
-        snap_id = snap.id
+        task_id = str(uuid.uuid4())
+        q: queue.Queue = queue.Queue()
+        _tasks[task_id] = {'q': q, 'done': False}
 
-        ok, msg = winrm_utils.control_service(inst.server, inst.win_service_name, action)
+        client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                     or request.remote_addr or 'unknown')
+        inst_id = inst.id
 
-        # Refresh status after action
-        new_status = winrm_utils.get_service_status(inst.server, inst.win_service_name)
-        inst.status = new_status
-        inst.last_status_check = datetime.utcnow()
-        db.session.commit()
+        def worker():
+            try:
+                with app.app_context():
+                    inst_w = db.session.get(ServiceInstance, inst_id)
+                    if inst_w is None:
+                        q.put({'type': 'done', 'instance_id': inst_id, 'ok': False,
+                               'message': 'Экземпляр не найден', 'status': 'unknown'})
+                        return
 
-        _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
-               inst.id, inst.win_service_name,
-               details=f'action={action} server={inst.server.hostname} result={msg} status={new_status}',
-               result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR)
+                    q.put({'type': 'progress', 'instance_id': inst_id,
+                           'message': 'Снимаю снэпшот конфигурации…'})
+                    snap = _take_snapshot(inst_w, action, _ip=client_ip)
 
-        return jsonify({'ok': ok, 'message': msg, 'status': new_status, 'snapshot_id': snap_id})
+                    q.put({'type': 'progress', 'instance_id': inst_id,
+                           'message': f'Выполняю {action}…', 'snap_id': snap.id})
+                    ok, msg = winrm_utils.control_service(inst_w.server, inst_w.win_service_name, action)
 
+                    q.put({'type': 'progress', 'instance_id': inst_id,
+                           'message': 'Проверяю статус…'})
+                    new_status = winrm_utils.get_service_status(inst_w.server, inst_w.win_service_name)
+                    inst_w.status = new_status
+                    inst_w.last_status_check = datetime.utcnow()
+                    db.session.commit()
+
+                    _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
+                           inst_w.id, inst_w.win_service_name,
+                           details=f'action={action} server={inst_w.server.hostname} result={msg} status={new_status}',
+                           result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
+                           _ip=client_ip)
+
+                    q.put({'type': 'done', 'instance_id': inst_id, 'ok': ok,
+                           'message': msg, 'status': new_status, 'snap_id': snap.id})
+            except Exception as exc:
+                q.put({'type': 'done', 'instance_id': inst_id, 'ok': False,
+                       'message': str(exc), 'status': 'unknown'})
+            finally:
+                if task_id in _tasks:
+                    _tasks[task_id]['done'] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({'task_id': task_id})
+
+    # ------------------------------------------------------------------
+    # Control all instances of a service  →  POST returns task_id
+    # ------------------------------------------------------------------
     @app.route('/manage/services/<int:service_id>/control', methods=['POST'])
     def manage_service_control(service_id):
         svc = Service.query.get_or_404(service_id)
@@ -637,30 +715,73 @@ def create_app():
             return jsonify({'ok': False, 'error': 'Invalid action'}), 400
 
         current_env_id = session.get('current_env_id')
-        query = ServiceInstance.query.filter_by(service_id=service_id).join(Server)
+        q_inst = ServiceInstance.query.filter_by(service_id=service_id).join(Server)
         if current_env_id:
-            query = query.join(Server.environments).filter(Environment.id == current_env_id)
-        instances = query.all()
+            q_inst = q_inst.join(Server.environments).filter(Environment.id == current_env_id)
+        inst_ids = [i.id for i in q_inst.all()]
 
-        results = []
-        for inst in instances:
-            snap = _take_snapshot(inst, action)
-            db.session.flush()
-            ok, msg = winrm_utils.control_service(inst.server, inst.win_service_name, action)
-            new_status = winrm_utils.get_service_status(inst.server, inst.win_service_name)
-            inst.status = new_status
-            inst.last_status_check = datetime.utcnow()
-            _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
-                   inst.id, inst.win_service_name,
-                   details=f'action={action} bulk=service#{service_id} server={inst.server.hostname} result={msg} status={new_status}',
-                   result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR)
-            results.append({'instance_id': inst.id, 'ok': ok, 'message': msg,
-                            'status': new_status, 'snapshot_id': snap.id})
+        task_id = str(uuid.uuid4())
+        q: queue.Queue = queue.Queue()
+        _tasks[task_id] = {'q': q, 'done': False}
 
-        db.session.commit()
-        all_ok = all(r['ok'] for r in results)
-        return jsonify({'ok': all_ok, 'service': svc.name, 'results': results})
+        client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                     or request.remote_addr or 'unknown')
 
+        def worker():
+            results = []
+            try:
+                with app.app_context():
+                    for inst_id in inst_ids:
+                        inst_w = db.session.get(ServiceInstance, inst_id)
+                        if inst_w is None:
+                            results.append({'instance_id': inst_id, 'ok': False,
+                                            'message': 'Not found', 'status': 'unknown'})
+                            continue
+
+                        q.put({'type': 'progress', 'instance_id': inst_id,
+                               'message': f'[{inst_w.win_service_name}] Снимаю снэпшот…'})
+                        snap = _take_snapshot(inst_w, action, _ip=client_ip)
+
+                        q.put({'type': 'progress', 'instance_id': inst_id,
+                               'message': f'[{inst_w.win_service_name}] Выполняю {action}…',
+                               'snap_id': snap.id})
+                        ok, msg = winrm_utils.control_service(inst_w.server, inst_w.win_service_name, action)
+
+                        q.put({'type': 'progress', 'instance_id': inst_id,
+                               'message': f'[{inst_w.win_service_name}] Проверяю статус…'})
+                        new_status = winrm_utils.get_service_status(inst_w.server, inst_w.win_service_name)
+                        inst_w.status = new_status
+                        inst_w.last_status_check = datetime.utcnow()
+                        db.session.commit()
+
+                        _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
+                               inst_w.id, inst_w.win_service_name,
+                               details=f'action={action} bulk=service#{service_id} server={inst_w.server.hostname} result={msg} status={new_status}',
+                               result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
+                               _ip=client_ip)
+
+                        res = {'instance_id': inst_id, 'ok': ok, 'message': msg,
+                               'status': new_status, 'snap_id': snap.id}
+                        results.append(res)
+                        q.put({'type': 'instance_done', **res})
+
+            except Exception as exc:
+                q.put({'type': 'done_all', 'service_id': service_id, 'ok': False,
+                       'results': results, 'error': str(exc)})
+                return
+            finally:
+                if task_id in _tasks:
+                    _tasks[task_id]['done'] = True
+
+            q.put({'type': 'done_all', 'service_id': service_id,
+                   'ok': all(r['ok'] for r in results), 'results': results})
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({'task_id': task_id})
+
+    # ------------------------------------------------------------------
+    # Snapshot API
+    # ------------------------------------------------------------------
     @app.route('/manage/instances/<int:instance_id>/snapshots')
     def manage_instance_snapshots(instance_id):
         inst = ServiceInstance.query.get_or_404(instance_id)
@@ -668,26 +789,20 @@ def create_app():
                  .filter_by(instance_id=instance_id)
                  .order_by(ConfigSnapshot.created_at.desc())
                  .limit(20).all())
-        data = []
-        for s in snaps:
-            data.append({
-                'id': s.id,
-                'trigger': s.trigger,
-                'created_at': s.created_at.strftime('%d.%m.%Y %H:%M:%S'),
-                'files': len(json.loads(s.configs_json or '[]')),
-            })
-        return jsonify({'instance': inst.win_service_name, 'snapshots': data})
+        return jsonify({'instance': inst.win_service_name, 'snapshots': [
+            {'id': s.id, 'trigger': s.trigger,
+             'created_at': s.created_at.strftime('%d.%m.%Y %H:%M:%S'),
+             'files': len(json.loads(s.configs_json or '[]'))}
+            for s in snaps
+        ]})
 
     @app.route('/manage/snapshots/<int:snapshot_id>')
     def manage_snapshot_detail(snapshot_id):
         snap = ConfigSnapshot.query.get_or_404(snapshot_id)
-        configs = json.loads(snap.configs_json or '[]')
         return jsonify({
-            'id': snap.id,
-            'instance_id': snap.instance_id,
-            'trigger': snap.trigger,
+            'id': snap.id, 'instance_id': snap.instance_id, 'trigger': snap.trigger,
             'created_at': snap.created_at.strftime('%d.%m.%Y %H:%M:%S'),
-            'configs': configs,
+            'configs': json.loads(snap.configs_json or '[]'),
         })
 
     # ==================================================================
