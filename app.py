@@ -1249,6 +1249,291 @@ def create_app():
         threading.Thread(target=worker, daemon=True).start()
         return jsonify({'task_id': task_id})
 
+    # ==================================================================
+    # Manage — Config Management API
+    # ==================================================================
+
+    @app.route('/api/services/<int:service_id>/config-summary')
+    def api_service_config_summary(service_id):
+        """Конфиги сервиса + все версии + статус по каждому экземпляру (lazy-load)."""
+        svc = Service.query.get_or_404(service_id)
+        result = []
+        for cfg in svc.virtual_configs:
+            cur = cfg.current_version
+            versions = [
+                {'id': v.id, 'version': v.version, 'comment': v.comment or '',
+                 'created_at': v.created_at.strftime('%d.%m.%Y %H:%M'),
+                 'is_current': v.is_current}
+                for v in cfg.versions
+            ]
+            instances_status = []
+            for inst in svc.instances:
+                icfg = next((c for c in inst.configs if c.filename == cfg.filename), None)
+                if icfg is None or icfg.source_version_id is None:
+                    st, inst_ver_num = 'untracked', None
+                elif icfg.is_overridden:
+                    sv = db.session.get(ServiceConfigVersion, icfg.source_version_id)
+                    st, inst_ver_num = 'overridden', (sv.version if sv else None)
+                elif cur and icfg.source_version_id == cur.id:
+                    st, inst_ver_num = 'synced', cur.version
+                else:
+                    sv = db.session.get(ServiceConfigVersion, icfg.source_version_id)
+                    st, inst_ver_num = 'outdated', (sv.version if sv else None)
+                instances_status.append({
+                    'instance_id': inst.id,
+                    'win_name':    inst.win_service_name,
+                    'hostname':    inst.server.hostname,
+                    'status':      st,
+                    'version':     inst_ver_num,
+                })
+            result.append({
+                'id': cfg.id, 'filename': cfg.filename, 'description': cfg.description or '',
+                'current_version': cur.version if cur else None,
+                'current_version_id': cur.id if cur else None,
+                'versions': versions, 'instances': instances_status,
+            })
+        return jsonify({'service_id': service_id, 'service_name': svc.name,
+                        'display_name': svc.display_name or svc.name, 'configs': result})
+
+    # ------------------------------------------------------------------
+    # Deploy config to ALL instances of a service + optional restart
+    # ------------------------------------------------------------------
+    @app.route('/manage/services/<int:service_id>/config-deploy', methods=['POST'])
+    def manage_service_config_deploy(service_id):
+        svc  = Service.query.get_or_404(service_id)
+        data = request.get_json(silent=True) or {}
+        cfg_id     = data.get('cfg_id')
+        ver_id     = data.get('ver_id')
+        do_restart = bool(data.get('restart', True))
+        env_id     = data.get('env_id')
+        force      = bool(data.get('force', True))
+
+        cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+        ver = ServiceConfigVersion.query.filter_by(
+            id=ver_id, service_config_id=cfg_id).first_or_404()
+
+        q_inst = ServiceInstance.query.filter_by(service_id=service_id).join(Server)
+        if env_id:
+            q_inst = q_inst.join(Server.environments).filter(Environment.id == int(env_id))
+        instances = q_inst.all()
+        if not instances:
+            return jsonify({'ok': False, 'error': 'Нет экземпляров'}), 400
+
+        task_id = str(uuid.uuid4())
+        dq: queue.Queue = queue.Queue()
+        _tasks[task_id] = {'q': dq, 'done': False}
+
+        client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                     or request.remote_addr or 'unknown')
+        inst_ids  = [i.id for i in instances]
+        _ver_id   = ver.id
+        ver_num   = ver.version
+        cfg_fname = cfg.filename
+        svc_name  = svc.name
+
+        def _deploy_one(iid: int) -> dict:
+            with app.app_context():
+                inst_w = db.session.get(ServiceInstance, iid)
+                if inst_w is None:
+                    r = {'instance_id': iid, 'ok': False, 'message': 'Не найден',
+                         'hostname': '?', 'win_name': '?', 'status': 'unknown'}
+                    dq.put({'type': 'instance_done', **r}); return r
+
+                hostname = inst_w.server.hostname
+                win_name = inst_w.win_service_name
+                existing = InstanceConfig.query.filter_by(
+                    instance_id=iid, filename=cfg_fname).first()
+
+                if existing and existing.is_overridden and not force:
+                    r = {'instance_id': iid, 'ok': False, 'skipped': True,
+                         'message': 'Пропущен (изменён вручную)',
+                         'hostname': hostname, 'win_name': win_name, 'status': inst_w.status}
+                    dq.put({'type': 'instance_done', **r}); return r
+
+                # 1. Write config
+                dq.put({'type': 'progress', 'instance_id': iid,
+                        'message': f'[{hostname}] Записываю {cfg_fname}…'})
+                ver_obj  = db.session.get(ServiceConfigVersion, _ver_id)
+                content  = ver_obj.content or ''
+                filepath = (existing.filepath if existing else '') or ''
+                if not filepath and inst_w.config_dir:
+                    filepath = inst_w.config_dir.rstrip('\\') + '\\' + cfg_fname
+
+                write_ok, write_msg = False, 'filepath не задан'
+                if filepath:
+                    enc = (existing.encoding if existing else None) or 'utf-8'
+                    write_ok, write_msg = winrm_utils.write_file_content(
+                        inst_w.server, filepath, content, enc)
+
+                if existing:
+                    existing.content           = content
+                    existing.source_version_id = _ver_id
+                    existing.is_overridden     = False
+                    existing.updated_at        = datetime.utcnow()
+                else:
+                    db.session.add(InstanceConfig(
+                        instance_id=iid, filename=cfg_fname, filepath=filepath,
+                        content=content, source_version_id=_ver_id,
+                        is_overridden=False, encoding='utf-8', fetched_at=datetime.utcnow()))
+                db.session.flush()
+
+                # 2. Restart
+                restart_ok, restart_msg, new_status = True, '', inst_w.status
+                if do_restart:
+                    dq.put({'type': 'progress', 'instance_id': iid,
+                            'message': f'[{hostname}] Перезапуск {win_name}…'})
+                    restart_ok, restart_msg = winrm_utils.control_service(
+                        inst_w.server, win_name, 'restart')
+                    new_status = winrm_utils.get_service_status(inst_w.server, win_name)
+                    inst_w.status = new_status
+                    inst_w.last_status_check = datetime.utcnow()
+                db.session.commit()
+
+                ok    = (write_ok or not filepath) and restart_ok
+                parts = []
+                if filepath:
+                    parts.append(f'файл: {"ok" if write_ok else "ERR: " + write_msg}')
+                if do_restart:
+                    parts.append(f'restart: {"ok → " + new_status if restart_ok else "ERR: " + restart_msg}')
+                _audit(AuditLog.ACTION_PUSH_CONFIG, AuditLog.ENTITY_INSTANCE, iid, cfg_fname,
+                       details=f'service={svc_name} v{ver_num} → {win_name}@{hostname}'
+                               + (' +restart' if do_restart else '')
+                               + (f' | {", ".join(parts)}' if parts else ''),
+                       result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_WARNING,
+                       _ip=client_ip)
+
+                r = {'instance_id': iid, 'ok': ok, 'message': '; '.join(parts) or 'ok',
+                     'hostname': hostname, 'win_name': win_name,
+                     'status': new_status, 'version': ver_num}
+                dq.put({'type': 'instance_done', **r}); return r
+
+        def deploy_worker():
+            results: list[dict] = []
+            try:
+                max_w = max(1, min(len(inst_ids), 8))
+                with ThreadPoolExecutor(max_workers=max_w) as pool:
+                    futures = {pool.submit(_deploy_one, iid): iid for iid in inst_ids}
+                    for future in as_completed(futures):
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            iid = futures[future]
+                            err = {'instance_id': iid, 'ok': False, 'message': str(exc),
+                                   'hostname': '?', 'win_name': '?', 'status': 'unknown'}
+                            results.append(err)
+                            dq.put({'type': 'instance_done', **err})
+                dq.put({'type': 'done_all', 'ok': all(r['ok'] for r in results),
+                        'results': results, 'cfg_filename': cfg_fname, 'version': ver_num})
+            except Exception as exc:
+                dq.put({'type': 'done_all', 'ok': False, 'results': results, 'error': str(exc)})
+            finally:
+                if task_id in _tasks:
+                    _tasks[task_id]['done'] = True
+
+        threading.Thread(target=deploy_worker, daemon=True).start()
+        return jsonify({'task_id': task_id})
+
+    # ------------------------------------------------------------------
+    # Deploy config to ONE instance + optional restart
+    # ------------------------------------------------------------------
+    @app.route('/manage/instances/<int:instance_id>/config-deploy', methods=['POST'])
+    def manage_instance_config_deploy(instance_id):
+        inst = ServiceInstance.query.get_or_404(instance_id)
+        data = request.get_json(silent=True) or {}
+        cfg_id     = data.get('cfg_id')
+        ver_id     = data.get('ver_id')
+        do_restart = bool(data.get('restart', True))
+
+        cfg = ServiceConfig.query.filter_by(
+            id=cfg_id, service_id=inst.service_id).first_or_404()
+        ver = ServiceConfigVersion.query.filter_by(
+            id=ver_id, service_config_id=cfg_id).first_or_404()
+
+        task_id = str(uuid.uuid4())
+        dq: queue.Queue = queue.Queue()
+        _tasks[task_id] = {'q': dq, 'done': False}
+
+        client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                     or request.remote_addr or 'unknown')
+        inst_id   = inst.id
+        _ver_id   = ver.id
+        ver_num   = ver.version
+        cfg_fname = cfg.filename
+        svc_name  = inst.service.name
+
+        def worker():
+            try:
+                with app.app_context():
+                    inst_w   = db.session.get(ServiceInstance, inst_id)
+                    hostname = inst_w.server.hostname
+                    win_name = inst_w.win_service_name
+
+                    dq.put({'type': 'progress', 'instance_id': inst_id,
+                            'message': f'Записываю {cfg_fname}…'})
+                    ver_obj  = db.session.get(ServiceConfigVersion, _ver_id)
+                    content  = ver_obj.content or ''
+                    existing = InstanceConfig.query.filter_by(
+                        instance_id=inst_id, filename=cfg_fname).first()
+                    filepath = (existing.filepath if existing else '') or ''
+                    if not filepath and inst_w.config_dir:
+                        filepath = inst_w.config_dir.rstrip('\\') + '\\' + cfg_fname
+
+                    write_ok, write_msg = False, 'filepath не задан'
+                    if filepath:
+                        enc = (existing.encoding if existing else None) or 'utf-8'
+                        write_ok, write_msg = winrm_utils.write_file_content(
+                            inst_w.server, filepath, content, enc)
+
+                    if existing:
+                        existing.content           = content
+                        existing.source_version_id = _ver_id
+                        existing.is_overridden     = False
+                        existing.updated_at        = datetime.utcnow()
+                    else:
+                        db.session.add(InstanceConfig(
+                            instance_id=inst_id, filename=cfg_fname, filepath=filepath,
+                            content=content, source_version_id=_ver_id,
+                            is_overridden=False, encoding='utf-8', fetched_at=datetime.utcnow()))
+                    db.session.flush()
+
+                    restart_ok, restart_msg, new_status = True, '', inst_w.status
+                    if do_restart:
+                        dq.put({'type': 'progress', 'instance_id': inst_id,
+                                'message': f'Перезапуск {win_name}…'})
+                        restart_ok, restart_msg = winrm_utils.control_service(
+                            inst_w.server, win_name, 'restart')
+                        new_status = winrm_utils.get_service_status(inst_w.server, win_name)
+                        inst_w.status = new_status
+                        inst_w.last_status_check = datetime.utcnow()
+                    db.session.commit()
+
+                    ok    = (write_ok or not filepath) and restart_ok
+                    parts = []
+                    if filepath:
+                        parts.append(f'файл: {"ok" if write_ok else "ERR: " + write_msg}')
+                    if do_restart:
+                        parts.append(f'restart: {"ok → " + new_status if restart_ok else "ERR: " + restart_msg}')
+                    _audit(AuditLog.ACTION_PUSH_CONFIG, AuditLog.ENTITY_INSTANCE,
+                           inst_id, cfg_fname,
+                           details=f'service={svc_name} v{ver_num} → {win_name}@{hostname}'
+                                   + (' +restart' if do_restart else '')
+                                   + (f' | {", ".join(parts)}' if parts else ''),
+                           result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_WARNING,
+                           _ip=client_ip)
+                    dq.put({'type': 'done', 'instance_id': inst_id, 'ok': ok,
+                            'message': '; '.join(parts) or 'ok',
+                            'status': new_status, 'version': ver_num,
+                            'hostname': hostname, 'win_name': win_name})
+            except Exception as exc:
+                dq.put({'type': 'done', 'instance_id': inst_id, 'ok': False,
+                        'message': str(exc), 'status': 'unknown'})
+            finally:
+                if task_id in _tasks:
+                    _tasks[task_id]['done'] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({'task_id': task_id})
+
     # ------------------------------------------------------------------
     # Snapshot API
     # ------------------------------------------------------------------

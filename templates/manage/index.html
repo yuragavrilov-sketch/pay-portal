@@ -21,6 +21,20 @@
 /* Snapshot modal table */
 #snapModalTable td { font-size: .82rem; }
 #snapModalTable td.content-cell { font-family: monospace; white-space: pre; max-height: 200px; overflow: auto; }
+/* Config badges on instance rows */
+.cfg-ver-badge {
+  font-size: .63rem; cursor: pointer; white-space: nowrap;
+  border: 1px solid transparent; border-radius: 4px; padding: 1px 5px;
+}
+.cfg-ver-badge:hover { opacity: .8; }
+/* Config mgmt modal */
+#cfgMgmtModal .cfg-block { border: 1px solid var(--bs-border-color); border-radius: 6px; margin-bottom: .75rem; }
+#cfgMgmtModal .cfg-block-header {
+  background: var(--bs-secondary-bg); border-radius: 5px 5px 0 0;
+  padding: .45rem .75rem; font-size: .875rem;
+}
+#cfgMgmtModal .inst-cfg-row { font-size: .8rem; border-top: 1px solid var(--bs-border-color); padding: .35rem .75rem; }
+.deploy-progress-item { font-size: .8rem; }
 </style>
 {% endblock %}
 
@@ -60,7 +74,17 @@
     <span class="badge bg-dark ms-1">{{ insts | length }} экз.</span>
     <span class="ms-auto"></span>
 
-    {# Bulk control buttons — stop propagation so collapse doesn't toggle #}
+    {# ── Config management button ─────────────────────────── #}
+    {% if svc.virtual_configs %}
+    <button class="btn btn-sm btn-outline-info ctrl-btn"
+            onclick="event.stopPropagation(); openCfgMgmt({{ svc.id }}, '{{ (svc.display_name or svc.name) | e }}')"
+            title="Управление конфигурацией">
+      <i class="bi bi-file-earmark-code me-1"></i>Конфиги
+      <span class="badge bg-info text-dark ms-1">{{ svc.virtual_configs | length }}</span>
+    </button>
+    {% endif %}
+
+    {# Bulk control buttons #}
     <button class="btn btn-sm btn-outline-success ctrl-btn"
             onclick="event.stopPropagation(); ctrlService({{ svc.id }}, 'start')"
             title="Запустить все экземпляры">
@@ -84,7 +108,7 @@
   {# Collapse body — instances tree #}
   <div class="collapse show svc-tree-body" id="svc-body-{{ svc.id }}">
     {% for inst in insts %}
-    <div class="inst-row d-flex align-items-center gap-2 py-2 mt-1 rounded"
+    <div class="inst-row d-flex align-items-center gap-2 py-2 mt-1 rounded flex-wrap"
          id="inst-row-{{ inst.id }}">
 
       <i class="bi bi-server text-muted"></i>
@@ -104,6 +128,9 @@
         {{ inst.status }}
       </span>
       <span id="progress-{{ inst.id }}" class="text-info small fst-italic d-none ms-1"></span>
+
+      {# Config version badges (loaded lazily when openCfgMgmt is called) #}
+      <span id="cfg-badges-{{ inst.id }}" class="d-flex gap-1 flex-wrap"></span>
 
       <span class="ms-auto"></span>
 
@@ -150,6 +177,64 @@
 </div>
 {% endfor %}
 
+{# ══════════════════════════════════════════════════════════════════════
+   Config Management Modal
+═══════════════════════════════════════════════════════════════════════ #}
+<div class="modal fade" id="cfgMgmtModal" tabindex="-1" data-bs-backdrop="static">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+
+      <div class="modal-header">
+        <h5 class="modal-title">
+          <i class="bi bi-file-earmark-code me-2"></i>
+          Конфигурация — <span id="cm-svc-name">…</span>
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"
+                id="cm-close-btn"></button>
+      </div>
+
+      <div class="modal-body p-0">
+
+        {# Loading spinner #}
+        <div id="cm-loading" class="text-center py-5 text-muted">
+          <div class="spinner-border me-2"></div>Загрузка конфигурации…
+        </div>
+
+        {# Config list (rendered by JS) #}
+        <div id="cm-configs" class="d-none p-3"></div>
+
+        {# Deploy progress (shown after deploy start) #}
+        <div id="cm-progress" class="d-none border-top p-3">
+          <div class="d-flex align-items-center justify-content-between mb-2">
+            <span class="fw-semibold small" id="cm-prog-title">Применение…</span>
+            <button class="btn btn-sm btn-outline-secondary" onclick="clearProgress()">
+              <i class="bi bi-x-lg"></i>
+            </button>
+          </div>
+          <div class="progress mb-2" style="height:6px;">
+            <div id="cm-prog-bar" class="progress-bar progress-bar-striped progress-bar-animated"
+                 style="width:0%"></div>
+          </div>
+          <div id="cm-prog-log" class="text-muted small font-monospace mb-2"></div>
+          <div id="cm-prog-results" class="list-group list-group-flush"></div>
+          <div id="cm-prog-summary" class="mt-2 d-none"></div>
+        </div>
+
+      </div>
+
+      <div class="modal-footer py-2">
+        <span class="text-muted small me-auto" id="cm-footer-hint">
+          <i class="bi bi-info-circle me-1"></i>
+          Выберите версию → Deploy (только конфиг) или Deploy+Restart
+        </span>
+        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">
+          Закрыть
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
 {# ── Snapshot modal ─────────────────────────────────────────────── #}
 <div class="modal fade" id="snapshotModal" tabindex="-1">
   <div class="modal-dialog modal-xl modal-dialog-scrollable">
@@ -193,6 +278,9 @@
 {% block extra_js %}
 <script>
 // ── Helpers ──────────────────────────────────────────────────────────
+function escHtml(s) {
+  return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 function statusClass(st) {
   st = (st || '').toLowerCase();
   return st === 'running'  ? 'bg-success' :
@@ -200,26 +288,22 @@ function statusClass(st) {
          ['starting','stop pending'].includes(st) ? 'bg-warning text-dark' :
          'bg-secondary';
 }
-
 function setStatus(id, status) {
   const b = document.getElementById('status-' + id);
   if (!b) return;
   b.textContent = status;
   b.className = 'badge ms-1 ' + statusClass(status);
 }
-
 function setProgress(id, msg) {
   const el = document.getElementById('progress-' + id);
   if (!el) return;
   if (msg) { el.textContent = msg; el.classList.remove('d-none'); }
   else     { el.textContent = '';  el.classList.add('d-none'); }
 }
-
 function invalidateSnapCount(id) {
   const cnt = document.getElementById('snap-count-' + id);
   if (cnt) { cnt.textContent = '…'; cnt.dataset.loaded = 'false'; }
 }
-
 function toast(msg, isError) {
   const d = document.createElement('div');
   d.className = `alert alert-${isError ? 'danger' : 'success'} alert-dismissible fade show
@@ -253,7 +337,6 @@ async function refreshStatus(id) {
   } catch { toast('Ошибка обновления статуса', true); }
   finally  { icon.classList.remove('spin'); }
 }
-
 async function refreshAllStatuses() {
   const ids = [...document.querySelectorAll('[id^="status-"]')]
     .map(el => el.id.replace('status-', ''));
@@ -272,9 +355,8 @@ async function ctrlInstance(id, action) {
   let taskId;
   try {
     const r = await fetch(`/manage/instances/${id}/control`, {
-      method:  'POST',
-      headers: {'Content-Type': 'application/json'},
-      body:    JSON.stringify({action}),
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action}),
     });
     ({task_id: taskId} = await r.json());
   } catch {
@@ -319,9 +401,8 @@ async function ctrlService(serviceId, action) {
   let taskId;
   try {
     const r = await fetch(`/manage/services/${serviceId}/control`, {
-      method:  'POST',
-      headers: {'Content-Type': 'application/json'},
-      body:    JSON.stringify({action}),
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action}),
     });
     ({task_id: taskId} = await r.json());
   } catch {
@@ -363,7 +444,348 @@ async function ctrlService(serviceId, action) {
   );
 }
 
-// ── Snapshots modal ──────────────────────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════════
+// Config Management Modal
+// ═══════════════════════════════════════════════════════════════════════
+
+let cmModal     = null;
+let cmSvcId     = null;
+let cmSummary   = null;   // last loaded config-summary data
+let cmDeployEs  = null;   // active SSE for deploy
+let cmDeployTotal = 0;
+let cmDeployDone  = 0;
+
+function getCmModal() {
+  if (!cmModal) cmModal = new bootstrap.Modal(document.getElementById('cfgMgmtModal'));
+  return cmModal;
+}
+
+async function openCfgMgmt(svcId, svcName) {
+  cmSvcId = svcId;
+  document.getElementById('cm-svc-name').textContent = svcName;
+  document.getElementById('cm-loading').classList.remove('d-none');
+  document.getElementById('cm-configs').classList.add('d-none');
+  clearProgress();
+  getCmModal().show();
+  await loadCfgSummary(svcId);
+}
+
+async function loadCfgSummary(svcId) {
+  try {
+    const r = await fetch(`/api/services/${svcId}/config-summary`);
+    cmSummary = await r.json();
+    renderCfgPanel(cmSummary);
+    renderCfgBadgesAll(cmSummary);
+  } catch(e) {
+    document.getElementById('cm-loading').innerHTML =
+      `<p class="text-danger">Ошибка загрузки: ${escHtml(String(e))}</p>`;
+  }
+}
+
+// ── Render config panel inside modal ─────────────────────────────────
+function renderCfgPanel(data) {
+  document.getElementById('cm-loading').classList.add('d-none');
+  const container = document.getElementById('cm-configs');
+  container.classList.remove('d-none');
+
+  if (!data.configs || data.configs.length === 0) {
+    container.innerHTML = '<p class="text-muted">Виртуальных конфигов нет.</p>';
+    return;
+  }
+
+  const stIcon = {
+    synced:    `<span class="badge bg-success"  style="font-size:.65rem;"><i class="bi bi-check-lg"></i> sync</span>`,
+    overridden:`<span class="badge bg-warning text-dark" style="font-size:.65rem;"><i class="bi bi-pencil"></i> изменён</span>`,
+    outdated:  `<span class="badge bg-danger"   style="font-size:.65rem;"><i class="bi bi-exclamation-triangle"></i> устарел</span>`,
+    untracked: `<span class="badge bg-secondary" style="font-size:.65rem;"><i class="bi bi-dash"></i> —</span>`,
+  };
+
+  let html = '';
+  for (const cfg of data.configs) {
+    // Build version selector options
+    const opts = cfg.versions.map(v =>
+      `<option value="${v.id}" ${v.is_current ? 'selected' : ''}>
+        v${v.version}${v.is_current ? ' ★' : ''} — ${escHtml(v.comment) || escHtml(v.created_at)}
+       </option>`
+    ).join('');
+
+    // Per-instance rows
+    const instRows = cfg.instances.map(inst => {
+      const verLabel = inst.version != null ? `v${inst.version}` : '—';
+      return `
+      <div class="inst-cfg-row d-flex align-items-center gap-2">
+        <span class="text-muted font-monospace" style="min-width:180px;">${escHtml(inst.win_name)}</span>
+        <span class="text-muted small">@${escHtml(inst.hostname)}</span>
+        <span class="badge bg-secondary ms-1" style="font-size:.65rem;">${verLabel}</span>
+        ${stIcon[inst.status] || stIcon.untracked}
+        <span class="ms-auto d-flex gap-1">
+          <button class="btn btn-xs btn-outline-primary" style="font-size:.72rem;padding:1px 7px;"
+                  onclick="deployToInst(${inst.instance_id}, ${cfg.id},
+                            document.getElementById('ver-sel-${cfg.id}').value, false)"
+                  title="Применить конфиг (без рестарта)">
+            <i class="bi bi-cloud-download"></i> Deploy
+          </button>
+          <button class="btn btn-xs btn-warning" style="font-size:.72rem;padding:1px 7px;"
+                  onclick="deployToInst(${inst.instance_id}, ${cfg.id},
+                            document.getElementById('ver-sel-${cfg.id}').value, true)"
+                  title="Применить конфиг + рестарт">
+            <i class="bi bi-arrow-repeat"></i> Deploy+↺
+          </button>
+        </span>
+      </div>`;
+    }).join('');
+
+    html += `
+    <div class="cfg-block" id="cm-cfg-block-${cfg.id}">
+      <div class="cfg-block-header d-flex align-items-center gap-2 flex-wrap">
+        <i class="bi bi-file-earmark-code text-info"></i>
+        <span class="fw-semibold font-monospace">${escHtml(cfg.filename)}</span>
+        ${cfg.description ? `<span class="text-muted small">— ${escHtml(cfg.description)}</span>` : ''}
+        <span class="ms-auto d-flex align-items-center gap-2">
+          <label class="text-muted small mb-0">Версия:</label>
+          <select id="ver-sel-${cfg.id}" class="form-select form-select-sm"
+                  style="width:auto;min-width:260px;">
+            ${opts}
+          </select>
+          <button class="btn btn-sm btn-outline-primary"
+                  onclick="deployToAll(${cfg.id}, false)"
+                  title="Применить выбранную версию ко всем экземплярам">
+            <i class="bi bi-cloud-download me-1"></i>Deploy all
+          </button>
+          <button class="btn btn-sm btn-warning"
+                  onclick="deployToAll(${cfg.id}, true)"
+                  title="Применить выбранную версию ко всем экземплярам + рестарт">
+            <i class="bi bi-arrow-repeat me-1"></i>Deploy+↺ all
+          </button>
+        </span>
+      </div>
+      ${instRows}
+    </div>`;
+  }
+
+  container.innerHTML = html;
+}
+
+// ── Render config version badges on instance rows in main page ────────
+function renderCfgBadgesAll(data) {
+  if (!data.configs) return;
+  // Build a map: instance_id -> [ {filename, status, version, cfg_id, versions} ]
+  const instMap = {};
+  for (const cfg of data.configs) {
+    for (const inst of cfg.instances) {
+      if (!instMap[inst.instance_id]) instMap[inst.instance_id] = [];
+      instMap[inst.instance_id].push({
+        filename: cfg.filename, cfg_id: cfg.id,
+        status: inst.status, version: inst.version,
+        versions: cfg.versions,
+        current_version_id: cfg.current_version_id,
+      });
+    }
+  }
+  for (const [instId, cfgs] of Object.entries(instMap)) {
+    const el = document.getElementById('cfg-badges-' + instId);
+    if (!el) continue;
+    el.innerHTML = cfgs.map(c => {
+      const verLabel = c.version != null ? `v${c.version}` : '—';
+      const cls =
+        c.status === 'synced'    ? 'bg-success text-white'   :
+        c.status === 'overridden'? 'bg-warning text-dark'    :
+        c.status === 'outdated'  ? 'bg-danger text-white'    :
+                                   'bg-secondary text-white' ;
+      return `<span class="cfg-ver-badge ${cls}"
+                    title="${escHtml(c.filename)} ${verLabel} — ${c.status}"
+                    onclick="openCfgMgmt(${cmSvcId || data.service_id},
+                             ${JSON.stringify(data.display_name || '')})">
+                ${escHtml(c.filename.split('.')[0])} ${verLabel}
+              </span>`;
+    }).join('');
+  }
+}
+
+// ── Progress helpers ──────────────────────────────────────────────────
+function clearProgress() {
+  if (cmDeployEs) { cmDeployEs.close(); cmDeployEs = null; }
+  document.getElementById('cm-progress').classList.add('d-none');
+  document.getElementById('cm-prog-results').innerHTML = '';
+  document.getElementById('cm-prog-summary').classList.add('d-none');
+  document.getElementById('cm-prog-summary').innerHTML = '';
+  document.getElementById('cm-prog-log').textContent = '';
+  document.getElementById('cm-prog-bar').style.width = '0%';
+  document.getElementById('cm-prog-bar').classList.add('progress-bar-animated');
+}
+
+function showProgress(title, total) {
+  cmDeployTotal = total;
+  cmDeployDone  = 0;
+  document.getElementById('cm-prog-title').textContent = title;
+  document.getElementById('cm-prog-bar').style.width = '0%';
+  document.getElementById('cm-prog-bar').classList.add('progress-bar-animated');
+  document.getElementById('cm-prog-results').innerHTML = '';
+  document.getElementById('cm-prog-summary').classList.add('d-none');
+  document.getElementById('cm-prog-log').textContent = 'Запуск…';
+  document.getElementById('cm-progress').classList.remove('d-none');
+}
+
+function addDeployResult(instId, hostname, winName, ok, msg, skipped, newStatus, newVersion) {
+  const el = document.createElement('div');
+  el.className = 'list-group-item deploy-progress-item d-flex align-items-center gap-2 py-1';
+  const badge = skipped
+    ? `<span class="badge bg-secondary flex-shrink-0"><i class="bi bi-skip-forward me-1"></i>пропущен</span>`
+    : ok
+      ? `<span class="badge bg-success flex-shrink-0"><i class="bi bi-check-lg me-1"></i>ok</span>`
+      : `<span class="badge bg-danger flex-shrink-0"><i class="bi bi-x-lg me-1"></i>ошибка</span>`;
+  const statusBadge = newStatus
+    ? `<span class="badge ${statusClass(newStatus)} ms-1" style="font-size:.65rem;">${newStatus}</span>`
+    : '';
+  const verBadge = newVersion
+    ? `<span class="badge bg-primary ms-1" style="font-size:.65rem;">v${newVersion}</span>`
+    : '';
+  el.innerHTML = `
+    ${badge}
+    <span class="font-monospace flex-grow-1">${escHtml(winName)}</span>
+    <span class="text-muted small">${escHtml(hostname)}</span>
+    ${verBadge}${statusBadge}
+    ${msg ? `<span class="text-muted small text-truncate" style="max-width:200px;" title="${escHtml(msg)}">${escHtml(msg)}</span>` : ''}
+  `;
+  document.getElementById('cm-prog-results').appendChild(el);
+
+  // Also update status badge in main page
+  if (newStatus && instId) setStatus(instId, newStatus);
+}
+
+function updateProgressBar() {
+  const pct = cmDeployTotal > 0 ? Math.round(cmDeployDone / cmDeployTotal * 100) : 0;
+  document.getElementById('cm-prog-bar').style.width = pct + '%';
+}
+
+function finalizeDeployProgress(ok, results) {
+  document.getElementById('cm-prog-bar').style.width = '100%';
+  document.getElementById('cm-prog-bar').classList.remove('progress-bar-animated');
+  document.getElementById('cm-prog-log').textContent = '';
+
+  const okN   = (results||[]).filter(r=>r.ok).length;
+  const skipN = (results||[]).filter(r=>r.skipped).length;
+  const failN = (results||[]).filter(r=>!r.ok && !r.skipped).length;
+  const cls   = failN > 0 ? 'alert-danger' : skipN > 0 ? 'alert-warning' : 'alert-success';
+  const sum   = document.getElementById('cm-prog-summary');
+  sum.className = `alert ${cls} py-2 small mt-2 mb-0`;
+  sum.innerHTML =
+    `<i class="bi bi-${ok ? 'check-circle' : 'exclamation-triangle'} me-1"></i>
+     Готово: применено <strong>${okN}</strong>`
+    + (skipN ? `, пропущено <strong>${skipN}</strong>` : '')
+    + (failN ? `, ошибок <strong>${failN}</strong>` : '')
+    + `.`;
+  sum.classList.remove('d-none');
+
+  // Reload config badges (re-query summary)
+  if (cmSvcId) loadCfgSummary(cmSvcId);
+}
+
+// ── Deploy ALL instances ──────────────────────────────────────────────
+async function deployToAll(cfgId, doRestart) {
+  const sel   = document.getElementById('ver-sel-' + cfgId);
+  const verId = parseInt(sel.value);
+  const verTxt= sel.options[sel.selectedIndex].text.trim();
+  const total = cmSummary?.configs?.find(c=>c.id===cfgId)?.instances?.length || 1;
+  const action = doRestart ? 'Deploy + Рестарт' : 'Deploy';
+
+  if (!confirm(`${action} «${verTxt}» → все ${total} экземпляра(ов)?`)) return;
+
+  showProgress(`${action}: все экземпляры / ${verTxt}`, total);
+
+  let taskId;
+  try {
+    const r = await fetch(`/manage/services/${cmSvcId}/config-deploy`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cfg_id: cfgId, ver_id: verId, restart: doRestart, force: true}),
+    });
+    const d = await r.json();
+    if (!d.task_id) throw new Error(d.error || 'нет task_id');
+    taskId = d.task_id;
+  } catch(e) {
+    document.getElementById('cm-prog-log').textContent = 'Ошибка: ' + e;
+    return;
+  }
+
+  if (cmDeployEs) cmDeployEs.close();
+  cmDeployEs = subscribeTask(taskId,
+    (data, es) => {
+      if (data.type === 'progress') {
+        document.getElementById('cm-prog-log').textContent = data.message || '';
+      } else if (data.type === 'instance_done') {
+        cmDeployDone++;
+        updateProgressBar();
+        addDeployResult(data.instance_id, data.hostname, data.win_name,
+                        data.ok, data.message, data.skipped,
+                        data.status, data.version);
+      } else if (data.type === 'done_all') {
+        es.close(); cmDeployEs = null;
+        finalizeDeployProgress(data.ok, data.results);
+      }
+    },
+    () => { cmDeployEs = null; document.getElementById('cm-prog-log').textContent = 'Соединение прервано.'; }
+  );
+}
+
+// ── Deploy ONE instance ───────────────────────────────────────────────
+async function deployToInst(instId, cfgId, verId, doRestart) {
+  verId = parseInt(verId);
+  const sel   = document.getElementById('ver-sel-' + cfgId);
+  const verTxt= sel ? sel.options[sel.selectedIndex]?.text?.trim() : 'v?';
+  const action = doRestart ? 'Deploy + Рестарт' : 'Deploy';
+
+  if (!confirm(`${action} «${verTxt}» → этот экземпляр?`)) return;
+
+  showProgress(`${action}: один экземпляр / ${verTxt}`, 1);
+
+  let taskId;
+  try {
+    const r = await fetch(`/manage/instances/${instId}/config-deploy`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cfg_id: cfgId, ver_id: verId, restart: doRestart}),
+    });
+    const d = await r.json();
+    if (!d.task_id) throw new Error(d.error || 'нет task_id');
+    taskId = d.task_id;
+  } catch(e) {
+    document.getElementById('cm-prog-log').textContent = 'Ошибка: ' + e;
+    return;
+  }
+
+  if (cmDeployEs) cmDeployEs.close();
+  cmDeployEs = subscribeTask(taskId,
+    (data, es) => {
+      if (data.type === 'progress') {
+        document.getElementById('cm-prog-log').textContent = data.message || '';
+        setProgress(instId, data.message);
+      } else if (data.type === 'done') {
+        es.close(); cmDeployEs = null;
+        cmDeployDone = 1; updateProgressBar();
+        addDeployResult(data.instance_id, data.hostname || '', data.win_name || '',
+                        data.ok, data.message, false, data.status, data.version);
+        setProgress(instId, '');
+        finalizeDeployProgress(data.ok, [data]);
+        invalidateSnapCount(instId);
+      }
+    },
+    () => {
+      cmDeployEs = null;
+      setProgress(instId, '');
+      document.getElementById('cm-prog-log').textContent = 'Соединение прервано.';
+    }
+  );
+}
+
+// Close SSE on modal hide
+document.getElementById('cfgMgmtModal').addEventListener('hide.bs.modal', () => {
+  if (cmDeployEs) { cmDeployEs.close(); cmDeployEs = null; }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Snapshots modal
+// ═══════════════════════════════════════════════════════════════════════
 const snapModal = new bootstrap.Modal(document.getElementById('snapshotModal'));
 const snapDetailModal = new bootstrap.Modal(document.getElementById('snapDetailModal'));
 
@@ -442,19 +864,15 @@ async function showSnapshotDetail(snapId, name) {
     `<div class="accordion">${accordion}</div>`;
 }
 
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
 // ── Chevron animation for collapse ──────────────────────────────────
 document.querySelectorAll('[data-bs-toggle="collapse"]').forEach(btn => {
   const target = document.querySelector(btn.dataset.bsTarget);
   if (!target) return;
   target.addEventListener('show.bs.collapse', () => {
-    btn.querySelector('.svc-chevron').style.transform = 'rotate(0deg)';
+    btn.querySelector('.svc-chevron')?.style && (btn.querySelector('.svc-chevron').style.transform = 'rotate(0deg)');
   });
   target.addEventListener('hide.bs.collapse', () => {
-    btn.querySelector('.svc-chevron').style.transform = 'rotate(-90deg)';
+    btn.querySelector('.svc-chevron')?.style && (btn.querySelector('.svc-chevron').style.transform = 'rotate(-90deg)');
   });
 });
 
