@@ -179,6 +179,31 @@ def fetch_all_configs(server, config_dir: str) -> list[dict]:
     return results
 
 
+def write_file_content(server, filepath: str, content: str, encoding: str = 'utf-8') -> tuple[bool, str]:
+    """
+    Write text content to a file on the remote server via WinRM.
+    Uses base64 to avoid PowerShell encoding issues.
+    Returns (success, message).
+    """
+    import base64
+    if not WINRM_AVAILABLE:
+        return False, "pywinrm not installed"
+    try:
+        session = _get_session(server)
+        raw = content.encode(encoding, errors='replace')
+        b64 = base64.b64encode(raw).decode('ascii')
+        ps = f"""$bytes = [System.Convert]::FromBase64String('{b64}')
+[System.IO.File]::WriteAllBytes("{filepath}", $bytes)
+"""
+        r = session.run_ps(ps)
+        if r.status_code == 0:
+            return True, f"Записано {len(raw)} байт"
+        err = r.std_err.decode(errors='replace').strip()
+        return False, err or f"Exit code {r.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
 def list_services(server) -> tuple[list[dict], Optional[str]]:
     """
     Enumerate all Windows services on the server.

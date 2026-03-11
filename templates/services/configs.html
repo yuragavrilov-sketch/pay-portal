@@ -1,6 +1,14 @@
 {% extends 'base.html' %}
 {% block title %}Виртуальные конфиги — {{ svc.name }}{% endblock %}
 
+{% block extra_head %}
+<style>
+.sync-badge { font-size: .7rem; }
+.spin { animation: spin .8s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+{% endblock %}
+
 {% block content %}
 <nav aria-label="breadcrumb" class="mb-3">
   <ol class="breadcrumb">
@@ -15,16 +23,25 @@
     Виртуальные конфиги
     <span class="text-muted fw-normal">/ {{ svc.display_name or svc.name }}</span>
   </h5>
-  <a href="{{ url_for('service_config_create', service_id=svc.id) }}" class="btn btn-primary btn-sm">
-    <i class="bi bi-plus-lg me-1"></i>Добавить файл
-  </a>
+  <div class="d-flex gap-2">
+    {% if svc.virtual_configs %}
+    <button class="btn btn-warning btn-sm" onclick="forcePushAll()"
+            title="Принудительно применить ВСЕ конфиги ко ВСЕМ экземплярам сервиса">
+      <i class="bi bi-lightning-fill me-1"></i>Force Push All
+    </button>
+    {% endif %}
+    <a href="{{ url_for('service_config_create', service_id=svc.id) }}" class="btn btn-primary btn-sm">
+      <i class="bi bi-plus-lg me-1"></i>Добавить файл
+    </a>
+  </div>
 </div>
 
 <div class="alert alert-info py-2 small">
   <i class="bi bi-info-circle me-1"></i>
-  Виртуальные конфиги — это общие настройки, применяемые ко <strong>всем экземплярам</strong> сервиса
-  (например, <code>connectionmanager.json</code>, <code>logging.json</code>).
-  Они хранятся централизованно и отображаются на странице каждого экземпляра.
+  Виртуальные конфиги — общие настройки, применяемые ко <strong>всем экземплярам</strong> сервиса.
+  Каждое сохранение создаёт новую версию.
+  <strong><i class="bi bi-cloud-upload"></i> Push</strong> — применить к экземплярам с выбором ENV.
+  <strong><i class="bi bi-lightning-fill"></i> Force</strong> — принудительно, игнорируя ручные изменения.
 </div>
 
 {% if svc.virtual_configs %}
@@ -33,24 +50,78 @@
     <thead class="table-active">
       <tr>
         <th>Файл</th>
+        <th>Версия</th>
         <th>Описание</th>
         <th>Обновлён</th>
-        <th>Размер</th>
+        <th class="text-center">Синхронизация</th>
         <th></th>
       </tr>
     </thead>
     <tbody>
       {% for cfg in svc.virtual_configs %}
-      <tr>
+      {% set s = sync_summaries.get(cfg.id, {}) %}
+      {% set ver = cfg.current_version %}
+      <tr id="cfg-row-{{ cfg.id }}">
         <td class="font-monospace fw-semibold">{{ cfg.filename }}</td>
+        <td>
+          {% if ver %}
+          <span class="badge bg-primary">v{{ ver.version }}</span>
+          {% else %}
+          <span class="badge bg-secondary">—</span>
+          {% endif %}
+        </td>
         <td class="text-muted small">{{ cfg.description or '—' }}</td>
         <td class="text-muted small">{{ cfg.updated_at.strftime('%d.%m.%Y %H:%M') }}</td>
-        <td class="text-muted small">{{ (cfg.content or '') | length }} б</td>
+        <td class="text-center" id="sync-cell-{{ cfg.id }}">
+          {% if s.get('total', 0) == 0 %}
+          <span class="text-muted small">нет экземпляров</span>
+          {% else %}
+          <span class="sync-badge badge bg-success me-1" title="In sync">
+            <i class="bi bi-check-lg"></i> {{ s.get('synced', 0) }}
+          </span>
+          {% if s.get('overridden', 0) %}
+          <span class="sync-badge badge bg-warning text-dark me-1" title="Изменён вручную">
+            <i class="bi bi-pencil"></i> {{ s.get('overridden', 0) }}
+          </span>
+          {% endif %}
+          {% if s.get('outdated', 0) %}
+          <span class="sync-badge badge bg-danger me-1" title="Устаревшая версия">
+            <i class="bi bi-exclamation-triangle"></i> {{ s.get('outdated', 0) }}
+          </span>
+          {% endif %}
+          {% if s.get('untracked', 0) %}
+          <span class="sync-badge badge bg-secondary me-1" title="Не синхронизировался">
+            <i class="bi bi-dash"></i> {{ s.get('untracked', 0) }}
+          </span>
+          {% endif %}
+          <span class="text-muted small">/ {{ s.get('total', 0) }}</span>
+          {% endif %}
+        </td>
         <td class="text-end">
+          {# Force Push (принудительно, напрямую через модал) #}
+          {% if ver %}
+          <button class="btn btn-sm btn-warning me-1"
+                  title="Force Push — применить v{{ ver.version }} ко ВСЕМ экземплярам, игнорируя ручные изменения"
+                  onclick="forcePushOne({{ cfg.id }}, '{{ cfg.filename }}', {{ ver.version }})">
+            <i class="bi bi-lightning-fill"></i>
+          </button>
+          {% endif %}
+          {# Push (страница с опциями) #}
+          <a href="{{ url_for('service_config_push_page', service_id=svc.id, cfg_id=cfg.id) }}"
+             class="btn btn-sm btn-outline-success me-1" title="Push (выбор окружения)">
+            <i class="bi bi-cloud-upload"></i>
+          </a>
+          {# History #}
+          <a href="{{ url_for('service_config_versions', service_id=svc.id, cfg_id=cfg.id) }}"
+             class="btn btn-sm btn-outline-info me-1" title="История версий">
+            <i class="bi bi-clock-history"></i>
+          </a>
+          {# Edit #}
           <a href="{{ url_for('service_config_edit', service_id=svc.id, cfg_id=cfg.id) }}"
              class="btn btn-sm btn-outline-secondary me-1">
             <i class="bi bi-pencil"></i>
           </a>
+          {# Delete #}
           <form method="post"
                 action="{{ url_for('service_config_delete', service_id=svc.id, cfg_id=cfg.id) }}"
                 class="d-inline"
@@ -65,11 +136,273 @@
     </tbody>
   </table>
 </div>
+
+{# Легенда #}
+<div class="small text-muted mt-1">
+  <i class="bi bi-check-lg text-success"></i> in sync &nbsp;
+  <i class="bi bi-pencil text-warning"></i> изменён вручную &nbsp;
+  <i class="bi bi-exclamation-triangle text-danger"></i> устаревшая версия &nbsp;
+  <i class="bi bi-dash text-secondary"></i> не синхронизировался
+</div>
+
 {% else %}
 <div class="text-center py-5 text-muted">
   <i class="bi bi-file-earmark-x fs-1 d-block mb-2"></i>
   Виртуальных конфигов ещё нет.
   <a href="{{ url_for('service_config_create', service_id=svc.id) }}">Добавить первый?</a>
 </div>
+{% endif %}
+
+{# ── Force Push Modal ─────────────────────────────────────────────── #}
+<div class="modal fade" id="forcePushModal" tabindex="-1" data-bs-backdrop="static">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">
+          <i class="bi bi-lightning-fill text-warning me-2"></i>
+          Force Push — <span id="fp-title">…</span>
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" id="fp-close-btn" disabled></button>
+      </div>
+      <div class="modal-body">
+        {# Progress bar #}
+        <div class="progress mb-3" style="height:6px;" id="fp-progress-wrap">
+          <div id="fp-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-warning"
+               style="width:0%"></div>
+        </div>
+
+        {# Instance results list #}
+        <div class="list-group list-group-flush" id="fp-results"></div>
+
+        {# Current status line #}
+        <p id="fp-log" class="text-muted small font-monospace mt-2 mb-0"></p>
+      </div>
+      <div class="modal-footer" id="fp-footer">
+        <span class="text-muted small me-auto" id="fp-summary-text"></span>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"
+                id="fp-done-btn" disabled>
+          Закрыть
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{% if svc.virtual_configs %}
+<script>
+// Метаданные всех конфигов этого сервиса для Force Push All
+const ALL_CONFIGS = [
+  {% for cfg in svc.virtual_configs %}
+  {% if cfg.current_version %}
+  { id: {{ cfg.id }}, filename: {{ cfg.filename | tojson }}, version: {{ cfg.current_version.version }},
+    pushUrl: '{{ url_for("service_config_push", service_id=svc.id, cfg_id=cfg.id) }}' },
+  {% endif %}
+  {% endfor %}
+];
+
+const TOTAL_INSTANCES = {{ svc.instances | length }};
+
+let fpModal = null;
+let fpDoneCount = 0;
+let fpTotalItems = 0;
+let fpCurrentEs = null;
+let reloadOnClose = false;
+
+function getModal() {
+  if (!fpModal) fpModal = new bootstrap.Modal(document.getElementById('forcePushModal'));
+  return fpModal;
+}
+
+// ── Force Push одного конфига ─────────────────────────────────────────
+function forcePushOne(cfgId, filename, version) {
+  if (!confirm(
+    `Force Push «${filename}» v${version}\n\n` +
+    `Текущая версия будет применена ко ВСЕМ ${TOTAL_INSTANCES} экземплярам сервиса,\n` +
+    `включая те, что были изменены вручную.\n\n` +
+    `Продолжить?`
+  )) return;
+
+  const pushUrl = ALL_CONFIGS.find(c => c.id === cfgId)?.pushUrl
+    || `/services/{{ svc.id }}/configs/${cfgId}/push`;
+
+  openForcePushModal(`${filename} v${version}`, TOTAL_INSTANCES);
+  runForcePush(cfgId, pushUrl, false);
+}
+
+// ── Force Push всех конфигов сервиса (последовательно) ───────────────
+async function forcePushAll() {
+  const hasCurrent = ALL_CONFIGS.length > 0;
+  if (!hasCurrent) {
+    alert('Нет конфигов с активной версией для применения.');
+    return;
+  }
+  if (!confirm(
+    `Force Push ALL — применить ВСЕ ${ALL_CONFIGS.length} конфиг(ов) ко ВСЕМ ${TOTAL_INSTANCES} экземплярам?\n\n` +
+    `Все ручные изменения на экземплярах будут перезаписаны.\n\nПродолжить?`
+  )) return;
+
+  const totalItems = ALL_CONFIGS.length * TOTAL_INSTANCES;
+  openForcePushModal(`все конфиги (${ALL_CONFIGS.length} файлов)`, totalItems);
+
+  for (const cfg of ALL_CONFIGS) {
+    if (fpCurrentEs) { fpCurrentEs.close(); fpCurrentEs = null; }
+    addSeparator(cfg.filename, cfg.version);
+    await runForcePush(cfg.id, cfg.pushUrl, true);
+  }
+  finalizePush();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
+function openForcePushModal(title, totalItems) {
+  fpDoneCount   = 0;
+  fpTotalItems  = totalItems;
+  reloadOnClose = false;
+
+  document.getElementById('fp-title').textContent      = title;
+  document.getElementById('fp-results').innerHTML      = '';
+  document.getElementById('fp-log').textContent        = 'Запуск…';
+  document.getElementById('fp-summary-text').textContent = '';
+  document.getElementById('fp-bar').style.width        = '0%';
+  document.getElementById('fp-close-btn').disabled     = true;
+  document.getElementById('fp-done-btn').disabled      = true;
+
+  getModal().show();
+}
+
+function addSeparator(filename, version) {
+  const el = document.createElement('div');
+  el.className = 'list-group-item list-group-item-secondary py-1 small fw-semibold font-monospace';
+  el.innerHTML = `<i class="bi bi-file-earmark-code me-1"></i>${escHtml(filename)} <span class="badge bg-primary ms-1">v${version}</span>`;
+  document.getElementById('fp-results').appendChild(el);
+}
+
+function addResult(instId, hostname, winName, ok, msg, skipped) {
+  const el = document.createElement('div');
+  el.id = `fp-inst-${instId}`;
+  el.className = 'list-group-item d-flex align-items-center gap-2 py-1';
+
+  let badge;
+  if (skipped) {
+    badge = `<span class="badge bg-secondary flex-shrink-0"><i class="bi bi-skip-forward me-1"></i>пропущен</span>`;
+  } else if (ok) {
+    badge = `<span class="badge bg-success flex-shrink-0"><i class="bi bi-check-lg me-1"></i>ok</span>`;
+  } else {
+    badge = `<span class="badge bg-danger flex-shrink-0"><i class="bi bi-x-lg me-1"></i>ошибка</span>`;
+  }
+
+  el.innerHTML = `
+    ${badge}
+    <span class="font-monospace small flex-grow-1">${escHtml(winName)}</span>
+    <span class="text-muted small">${escHtml(hostname)}</span>
+    ${(!ok || msg) ? `<span class="text-muted small text-truncate" style="max-width:220px;" title="${escHtml(msg)}">${escHtml(msg)}</span>` : ''}
+  `;
+  document.getElementById('fp-results').appendChild(el);
+}
+
+function updateProgress(done, total) {
+  const pct = total > 0 ? Math.round(done / total * 100) : 0;
+  document.getElementById('fp-bar').style.width = pct + '%';
+}
+
+function finalizePush() {
+  document.getElementById('fp-bar').style.width = '100%';
+  document.getElementById('fp-bar').classList.remove('progress-bar-animated');
+  document.getElementById('fp-log').textContent = '';
+  document.getElementById('fp-close-btn').disabled = false;
+  document.getElementById('fp-done-btn').disabled  = false;
+
+  // Подсчёт итогов из DOM
+  const results = document.getElementById('fp-results');
+  const ok      = results.querySelectorAll('.bg-success').length;
+  const fail    = results.querySelectorAll('.bg-danger').length;
+  const skip    = results.querySelectorAll('.bg-secondary').length;
+
+  const cls = fail > 0 ? 'text-danger' : (skip > 0 ? 'text-warning' : 'text-success');
+  document.getElementById('fp-summary-text').innerHTML =
+    `<span class="${cls}">Готово: применено ${ok}${skip ? `, пропущено ${skip}` : ''}${fail ? `, ошибок ${fail}` : ''}</span>`;
+
+  // Перезагружаем синхронизацию при закрытии модала
+  reloadOnClose = true;
+}
+
+// ── Выполнение одного push через SSE ─────────────────────────────────
+// Возвращает Promise, который резолвится после done_all
+function runForcePush(cfgId, pushUrl, multiMode) {
+  return new Promise((resolve) => {
+    fetch(pushUrl, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ force: true }),
+    })
+    .then(r => r.json())
+    .then(d => {
+      if (!d.task_id) {
+        document.getElementById('fp-log').textContent = 'Ошибка: ' + (d.error || 'нет task_id');
+        if (!multiMode) finalizePush();
+        resolve();
+        return;
+      }
+
+      const es = new EventSource(`/manage/tasks/${d.task_id}/stream`);
+      fpCurrentEs = es;
+
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.type === 'heartbeat') return;
+
+        if (data.type === 'progress') {
+          document.getElementById('fp-log').textContent = data.message || '';
+
+        } else if (data.type === 'instance_done') {
+          fpDoneCount++;
+          updateProgress(fpDoneCount, fpTotalItems);
+          addResult(
+            data.instance_id,
+            data.hostname || '?',
+            data.win_name || '?',
+            data.ok,
+            data.message || '',
+            data.skipped || false,
+          );
+          document.getElementById('fp-log').textContent = data.message || '';
+
+        } else if (data.type === 'done_all') {
+          es.close();
+          fpCurrentEs = null;
+          if (!multiMode) finalizePush();
+          resolve();
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        fpCurrentEs = null;
+        document.getElementById('fp-log').textContent = 'Соединение прервано.';
+        if (!multiMode) finalizePush();
+        resolve();
+      };
+    })
+    .catch(err => {
+      document.getElementById('fp-log').textContent = 'Ошибка запроса: ' + err;
+      if (!multiMode) finalizePush();
+      resolve();
+    });
+  });
+}
+
+function escHtml(s) {
+  return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Закрываем EventSource при закрытии модала; перезагружаем если push завершён
+document.getElementById('forcePushModal').addEventListener('hide.bs.modal', () => {
+  if (fpCurrentEs) { fpCurrentEs.close(); fpCurrentEs = null; }
+});
+document.getElementById('forcePushModal').addEventListener('hidden.bs.modal', () => {
+  if (reloadOnClose) { reloadOnClose = false; location.reload(); }
+});
+</script>
 {% endif %}
 {% endblock %}

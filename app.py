@@ -15,7 +15,12 @@ from flask import (
     Flask, render_template, redirect, url_for, request,
     flash, session, jsonify, Response, stream_with_context,
 )
-from models import db, AuditLog, ConfigSnapshot, Environment, Credential, Server, Service, ServiceInstance, InstanceConfig, ServiceConfig
+from sqlalchemy import text
+from models import (
+    db, AuditLog, ConfigSnapshot, Environment, Credential,
+    Server, Service, ServiceInstance, InstanceConfig, ServiceConfig,
+    ServiceConfigVersion, _next_version,
+)
 from logger import setup_logging
 import winrm_utils
 
@@ -72,6 +77,33 @@ def _audit(
         log.exception('Failed to write audit log: %s', exc)
 
 
+def _migrate_db(app):
+    """Idempotent: добавляет новые колонки в существующие таблицы (PostgreSQL)."""
+    with app.app_context():
+        with db.engine.connect() as conn:
+            checks = [
+                (
+                    "instance_configs", "source_version_id",
+                    "ALTER TABLE instance_configs "
+                    "ADD COLUMN source_version_id INTEGER "
+                    "REFERENCES service_config_versions(id) ON DELETE SET NULL",
+                ),
+                (
+                    "instance_configs", "is_overridden",
+                    "ALTER TABLE instance_configs "
+                    "ADD COLUMN is_overridden BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
+            ]
+            for table, column, ddl in checks:
+                row = conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name=:t AND column_name=:c"
+                ), {"t": table, "c": column}).fetchone()
+                if not row:
+                    conn.execute(text(ddl))
+            conn.commit()
+
+
 def create_app():
     app = Flask(__name__)
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-change-me')
@@ -86,6 +118,7 @@ def create_app():
 
     with app.app_context():
         db.create_all()
+        _migrate_db(app)
 
     # ------------------------------------------------------------------
     # Context processor
@@ -418,7 +451,30 @@ def create_app():
     @app.route('/services/<int:service_id>/configs')
     def service_configs(service_id):
         svc = Service.query.get_or_404(service_id)
-        return render_template('services/configs.html', svc=svc)
+        # Сводка синхронизации: для каждого ServiceConfig считаем сколько экземпляров in-sync
+        sync_summaries = {}
+        for cfg in svc.virtual_configs:
+            cur = cfg.current_version
+            total = len(svc.instances)
+            if not cur:
+                sync_summaries[cfg.id] = {'synced': 0, 'overridden': 0, 'outdated': 0,
+                                          'untracked': total, 'total': total, 'version': None}
+                continue
+            counts = {'synced': 0, 'overridden': 0, 'outdated': 0, 'untracked': 0}
+            for inst in svc.instances:
+                icfg = next((c for c in inst.configs if c.filename == cfg.filename), None)
+                if icfg is None or icfg.source_version_id is None:
+                    counts['untracked'] += 1
+                elif icfg.is_overridden:
+                    counts['overridden'] += 1
+                elif icfg.source_version_id == cur.id:
+                    counts['synced'] += 1
+                else:
+                    counts['outdated'] += 1
+            counts['total'] = total
+            counts['version'] = cur.version
+            sync_summaries[cfg.id] = counts
+        return render_template('services/configs.html', svc=svc, sync_summaries=sync_summaries)
 
     @app.route('/services/<int:service_id>/configs/create', methods=['GET', 'POST'])
     def service_config_create(service_id):
@@ -428,17 +484,34 @@ def create_app():
             if ServiceConfig.query.filter_by(service_id=service_id, filename=filename).first():
                 flash(f'Файл "{filename}" уже существует для этого сервиса.', 'danger')
             else:
+                content = request.form.get('content', '')
                 cfg = ServiceConfig(
                     service_id=service_id,
                     filename=filename,
                     description=request.form.get('description', '').strip(),
-                    content=request.form.get('content', ''),
+                    content=content,
                 )
                 db.session.add(cfg)
+                db.session.flush()  # получаем cfg.id
+
+                client_ip = (
+                    request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                    or request.remote_addr or 'unknown'
+                )
+                ver = ServiceConfigVersion(
+                    service_config_id=cfg.id,
+                    version=1,
+                    content=content,
+                    comment=request.form.get('comment', '').strip() or 'Первая версия',
+                    is_current=True,
+                    created_by=client_ip,
+                )
+                db.session.add(ver)
                 db.session.commit()
+
                 _audit(AuditLog.ACTION_CREATE, 'service_config', cfg.id, filename,
-                       details=f'service={svc.name}')
-                flash(f'Виртуальный конфиг "{filename}" создан.', 'success')
+                       details=f'service={svc.name} v1')
+                flash(f'Виртуальный конфиг "{filename}" создан (v1).', 'success')
                 return redirect(url_for('service_configs', service_id=service_id))
         return render_template('services/config_edit.html', svc=svc, cfg=None)
 
@@ -447,14 +520,36 @@ def create_app():
         svc = Service.query.get_or_404(service_id)
         cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
         if request.method == 'POST':
+            new_content = request.form.get('content', '')
             cfg.filename    = request.form['filename'].strip()
             cfg.description = request.form.get('description', '').strip()
-            cfg.content     = request.form.get('content', '')
+            cfg.content     = new_content
             cfg.updated_at  = datetime.utcnow()
+
+            client_ip = (
+                request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                or request.remote_addr or 'unknown'
+            )
+            # Снимаем флаг is_current у всех предыдущих версий
+            ServiceConfigVersion.query.filter_by(
+                service_config_id=cfg.id
+            ).update({'is_current': False})
+
+            next_v = _next_version(cfg.id)
+            ver = ServiceConfigVersion(
+                service_config_id=cfg.id,
+                version=next_v,
+                content=new_content,
+                comment=request.form.get('comment', '').strip() or f'Версия {next_v}',
+                is_current=True,
+                created_by=client_ip,
+            )
+            db.session.add(ver)
             db.session.commit()
+
             _audit(AuditLog.ACTION_UPDATE, 'service_config', cfg.id, cfg.filename,
-                   details=f'service={svc.name}')
-            flash('Конфиг сохранён.', 'success')
+                   details=f'service={svc.name} v{next_v}')
+            flash(f'Конфиг сохранён как версия v{next_v}.', 'success')
             return redirect(url_for('service_configs', service_id=service_id))
         return render_template('services/config_edit.html', svc=svc, cfg=cfg)
 
@@ -469,6 +564,226 @@ def create_app():
                details=f'service={svc_name}')
         flash(f'Виртуальный конфиг "{filename}" удалён.', 'success')
         return redirect(url_for('service_configs', service_id=service_id))
+
+    # ------------------------------------------------------------------
+    # Service Config — Version history
+    # ------------------------------------------------------------------
+
+    @app.route('/services/<int:service_id>/configs/<int:cfg_id>/versions')
+    def service_config_versions(service_id, cfg_id):
+        svc = Service.query.get_or_404(service_id)
+        cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+        versions = (ServiceConfigVersion.query
+                    .filter_by(service_config_id=cfg_id)
+                    .order_by(ServiceConfigVersion.version.desc())
+                    .all())
+        return render_template('services/config_versions.html',
+                               svc=svc, cfg=cfg, versions=versions)
+
+    @app.route('/services/<int:service_id>/configs/<int:cfg_id>/versions/<int:ver_id>/activate',
+               methods=['POST'])
+    def service_config_version_activate(service_id, cfg_id, ver_id):
+        svc = Service.query.get_or_404(service_id)
+        cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+        ver = ServiceConfigVersion.query.filter_by(
+            id=ver_id, service_config_id=cfg_id
+        ).first_or_404()
+
+        # Снять is_current со всех версий, поставить на выбранную
+        ServiceConfigVersion.query.filter_by(service_config_id=cfg_id).update({'is_current': False})
+        ver.is_current = True
+        cfg.content    = ver.content  # синхронизируем поле content
+        cfg.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        _audit(AuditLog.ACTION_ROLLBACK_CONFIG, 'service_config', cfg.id, cfg.filename,
+               details=f'service={svc.name} rollback to v{ver.version}')
+        flash(f'Конфиг "{cfg.filename}" откачен к версии v{ver.version}.', 'success')
+        return redirect(url_for('service_config_versions', service_id=service_id, cfg_id=cfg_id))
+
+    # ------------------------------------------------------------------
+    # Service Config — Push to instances (async SSE)
+    # ------------------------------------------------------------------
+
+    @app.route('/services/<int:service_id>/configs/<int:cfg_id>/push')
+    def service_config_push_page(service_id, cfg_id):
+        svc = Service.query.get_or_404(service_id)
+        cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+        environments = Environment.query.order_by(Environment.name).all()
+        # Синхронизируем экземпляры с их статусом
+        icfg_map: dict = {}
+        for inst in svc.instances:
+            icfg = next((c for c in inst.configs if c.filename == cfg.filename), None)
+            cur  = cfg.current_version
+            if icfg is None or icfg.source_version_id is None:
+                status = 'untracked'
+            elif icfg.is_overridden:
+                status = 'overridden'
+            elif cur and icfg.source_version_id == cur.id:
+                status = 'synced'
+            else:
+                status = 'outdated'
+            icfg_map[inst.id] = status
+        return render_template('services/config_push.html',
+                               svc=svc, cfg=cfg,
+                               environments=environments,
+                               instance_statuses=icfg_map)
+
+    @app.route('/services/<int:service_id>/configs/<int:cfg_id>/push', methods=['POST'])
+    def service_config_push(service_id, cfg_id):
+        svc = Service.query.get_or_404(service_id)
+        cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+
+        cur_ver = cfg.current_version
+        if not cur_ver:
+            return jsonify({'ok': False, 'error': 'Нет активной версии для применения'}), 400
+
+        data      = request.get_json(silent=True) or {}
+        env_id    = data.get('env_id')
+        force     = bool(data.get('force', False))
+
+        q_inst = ServiceInstance.query.filter_by(service_id=service_id).join(Server)
+        if env_id:
+            q_inst = q_inst.join(Server.environments).filter(Environment.id == int(env_id))
+        instances = q_inst.all()
+
+        if not instances:
+            return jsonify({'ok': False, 'error': 'Нет экземпляров для применения'}), 400
+
+        task_id   = str(uuid.uuid4())
+        q_queue: queue.Queue = queue.Queue()
+        _tasks[task_id] = {'q': q_queue, 'done': False}
+
+        client_ip = (
+            request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+            or request.remote_addr or 'unknown'
+        )
+        inst_ids    = [i.id for i in instances]
+        ver_id      = cur_ver.id
+        ver_num     = cur_ver.version
+        cfg_fname   = cfg.filename
+        svc_name    = svc.name
+
+        def process_one(iid: int) -> dict:
+            with app.app_context():
+                inst_w = db.session.get(ServiceInstance, iid)
+                if inst_w is None:
+                    r = {'instance_id': iid, 'ok': False,
+                         'message': 'Экземпляр не найден', 'hostname': '?', 'win_name': '?'}
+                    q_queue.put({'type': 'instance_done', **r})
+                    return r
+
+                hostname = inst_w.server.hostname
+                win_name = inst_w.win_service_name
+
+                existing = InstanceConfig.query.filter_by(
+                    instance_id=iid, filename=cfg_fname
+                ).first()
+
+                if existing and existing.is_overridden and not force:
+                    r = {'instance_id': iid, 'ok': False, 'skipped': True,
+                         'message': 'Пропущен (конфиг изменён вручную, используйте Force)',
+                         'hostname': hostname, 'win_name': win_name}
+                    q_queue.put({'type': 'instance_done', **r})
+                    return r
+
+                q_queue.put({'type': 'progress', 'instance_id': iid,
+                             'message': f'[{hostname}] Обновляю запись в БД…'})
+
+                ver = db.session.get(ServiceConfigVersion, ver_id)
+                content = ver.content or ''
+
+                if existing:
+                    filepath = existing.filepath
+                    existing.content          = content
+                    existing.source_version_id = ver_id
+                    existing.is_overridden    = False
+                    existing.updated_at       = datetime.utcnow()
+                else:
+                    filepath = ''
+                    if inst_w.config_dir:
+                        filepath = inst_w.config_dir.rstrip('\\') + '\\' + cfg_fname
+                    existing = InstanceConfig(
+                        instance_id=iid,
+                        filename=cfg_fname,
+                        filepath=filepath,
+                        content=content,
+                        source_version_id=ver_id,
+                        is_overridden=False,
+                        encoding='utf-8',
+                        fetched_at=datetime.utcnow(),
+                    )
+                    db.session.add(existing)
+
+                db.session.flush()
+
+                write_ok  = False
+                write_msg = 'filepath не задан'
+                if filepath:
+                    q_queue.put({'type': 'progress', 'instance_id': iid,
+                                 'message': f'[{hostname}] Записываю файл на сервер…'})
+                    enc = existing.encoding or 'utf-8'
+                    write_ok, write_msg = winrm_utils.write_file_content(
+                        inst_w.server, filepath, content, enc
+                    )
+
+                db.session.commit()
+
+                audit_result = (
+                    AuditLog.RESULT_OK if (not filepath or write_ok)
+                    else AuditLog.RESULT_WARNING
+                )
+                _audit(AuditLog.ACTION_PUSH_CONFIG, AuditLog.ENTITY_CONFIG,
+                       iid, cfg_fname,
+                       details=(
+                           f'service={svc_name} v{ver_num} → '
+                           f'instance={win_name} server={hostname}'
+                           + (f' | write={"ok" if write_ok else "fail: " + write_msg}'
+                              if filepath else ' | no_filepath')
+                       ),
+                       result=audit_result,
+                       _ip=client_ip)
+
+                msg = f'v{ver_num} применена'
+                if filepath:
+                    msg += f' | файл: {"записан" if write_ok else "ОШИБКА: " + write_msg}'
+
+                r = {'instance_id': iid, 'ok': True,
+                     'message': msg, 'hostname': hostname, 'win_name': win_name,
+                     'write_ok': write_ok or not filepath}
+                q_queue.put({'type': 'instance_done', **r})
+                return r
+
+        def worker():
+            results: list[dict] = []
+            try:
+                max_w = max(1, min(len(inst_ids), 8))
+                with ThreadPoolExecutor(max_workers=max_w) as pool:
+                    futures = {pool.submit(process_one, iid): iid for iid in inst_ids}
+                    for future in as_completed(futures):
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            iid = futures[future]
+                            err = {'instance_id': iid, 'ok': False,
+                                   'message': str(exc), 'hostname': '?', 'win_name': '?'}
+                            results.append(err)
+                            q_queue.put({'type': 'instance_done', **err})
+
+                q_queue.put({'type': 'done_all',
+                             'ok': all(r['ok'] for r in results),
+                             'results': results,
+                             'cfg_filename': cfg_fname,
+                             'version': ver_num})
+            except Exception as exc:
+                q_queue.put({'type': 'done_all', 'ok': False,
+                             'results': results, 'error': str(exc)})
+            finally:
+                if task_id in _tasks:
+                    _tasks[task_id]['done'] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({'task_id': task_id})
 
     # ==================================================================
     # Service Instances
@@ -606,7 +921,21 @@ def create_app():
     @app.route('/instances/<int:instance_id>')
     def instance_detail(instance_id):
         inst = ServiceInstance.query.get_or_404(instance_id)
-        return render_template('instances/detail.html', inst=inst)
+        # Sync-статус для каждого виртуального конфига
+        icfg_map = {c.filename: c for c in inst.configs}
+        sync_status = {}
+        for vcfg in inst.service.virtual_configs:
+            cur = vcfg.current_version
+            icfg = icfg_map.get(vcfg.filename)
+            if icfg is None or icfg.source_version_id is None:
+                sync_status[vcfg.id] = 'untracked'
+            elif icfg.is_overridden:
+                sync_status[vcfg.id] = 'overridden'
+            elif cur and icfg.source_version_id == cur.id:
+                sync_status[vcfg.id] = 'synced'
+            else:
+                sync_status[vcfg.id] = 'outdated'
+        return render_template('instances/detail.html', inst=inst, sync_status=sync_status)
 
     @app.route('/instances/<int:instance_id>/delete', methods=['POST'])
     def instance_delete(instance_id):
@@ -659,8 +988,9 @@ def create_app():
         inst = ServiceInstance.query.get_or_404(instance_id)
         cfg  = InstanceConfig.query.filter_by(id=config_id, instance_id=instance_id).first_or_404()
         if request.method == 'POST':
-            cfg.content    = request.form['content']
-            cfg.updated_at = datetime.utcnow()
+            cfg.content      = request.form['content']
+            cfg.updated_at   = datetime.utcnow()
+            cfg.is_overridden = True  # ручное редактирование = отклонение от service config
             db.session.commit()
             _audit(AuditLog.ACTION_UPDATE, AuditLog.ENTITY_CONFIG,
                    cfg.id, cfg.filename,
