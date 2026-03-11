@@ -134,17 +134,28 @@ if (Test-Path $dir) {{
 def fetch_file_content(server, filepath: str) -> tuple[Optional[str], str]:
     """
     Read a text file from the remote server.
+    Reads raw bytes via base64 to avoid PowerShell encoding issues,
+    then auto-detects encoding (utf-8-sig → utf-8 → cp1251).
     Returns (content, encoding).
     """
+    import base64
     if not WINRM_AVAILABLE:
         return None, 'utf-8'
     try:
         session = _get_session(server)
-        ps = f'Get-Content -Path "{filepath}" -Raw -Encoding UTF8'
+        # Read as raw bytes via base64 – works regardless of file encoding
+        ps = f'[Convert]::ToBase64String([IO.File]::ReadAllBytes("{filepath}"))'
         r = session.run_ps(ps)
-        if r.status_code == 0:
-            return r.std_out.decode('utf-8', errors='replace'), 'utf-8'
-        return None, 'utf-8'
+        if r.status_code != 0:
+            return None, 'utf-8'
+        raw = base64.b64decode(r.std_out.strip())
+        for enc in ('utf-8-sig', 'utf-8', 'cp1251'):
+            try:
+                return raw.decode(enc), enc
+            except UnicodeDecodeError:
+                continue
+        # Fallback: cp1251 with replacement characters
+        return raw.decode('cp1251', errors='replace'), 'cp1251'
     except Exception:
         return None, 'utf-8'
 

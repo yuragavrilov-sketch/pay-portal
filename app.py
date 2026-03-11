@@ -15,7 +15,7 @@ from flask import (
     Flask, render_template, redirect, url_for, request,
     flash, session, jsonify, Response, stream_with_context,
 )
-from models import db, AuditLog, ConfigSnapshot, Environment, Credential, Server, Service, ServiceInstance, InstanceConfig
+from models import db, AuditLog, ConfigSnapshot, Environment, Credential, Server, Service, ServiceInstance, InstanceConfig, ServiceConfig
 from logger import setup_logging
 import winrm_utils
 
@@ -410,6 +410,65 @@ def create_app():
         _audit(AuditLog.ACTION_DELETE, AuditLog.ENTITY_SERVICE, service_id, name)
         flash(f'Сервис "{name}" удалён.', 'success')
         return redirect(url_for('service_list'))
+
+    # ==================================================================
+    # Service Virtual Configs
+    # ==================================================================
+
+    @app.route('/services/<int:service_id>/configs')
+    def service_configs(service_id):
+        svc = Service.query.get_or_404(service_id)
+        return render_template('services/configs.html', svc=svc)
+
+    @app.route('/services/<int:service_id>/configs/create', methods=['GET', 'POST'])
+    def service_config_create(service_id):
+        svc = Service.query.get_or_404(service_id)
+        if request.method == 'POST':
+            filename = request.form['filename'].strip()
+            if ServiceConfig.query.filter_by(service_id=service_id, filename=filename).first():
+                flash(f'Файл "{filename}" уже существует для этого сервиса.', 'danger')
+            else:
+                cfg = ServiceConfig(
+                    service_id=service_id,
+                    filename=filename,
+                    description=request.form.get('description', '').strip(),
+                    content=request.form.get('content', ''),
+                )
+                db.session.add(cfg)
+                db.session.commit()
+                _audit(AuditLog.ACTION_CREATE, 'service_config', cfg.id, filename,
+                       details=f'service={svc.name}')
+                flash(f'Виртуальный конфиг "{filename}" создан.', 'success')
+                return redirect(url_for('service_configs', service_id=service_id))
+        return render_template('services/config_edit.html', svc=svc, cfg=None)
+
+    @app.route('/services/<int:service_id>/configs/<int:cfg_id>/edit', methods=['GET', 'POST'])
+    def service_config_edit(service_id, cfg_id):
+        svc = Service.query.get_or_404(service_id)
+        cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+        if request.method == 'POST':
+            cfg.filename    = request.form['filename'].strip()
+            cfg.description = request.form.get('description', '').strip()
+            cfg.content     = request.form.get('content', '')
+            cfg.updated_at  = datetime.utcnow()
+            db.session.commit()
+            _audit(AuditLog.ACTION_UPDATE, 'service_config', cfg.id, cfg.filename,
+                   details=f'service={svc.name}')
+            flash('Конфиг сохранён.', 'success')
+            return redirect(url_for('service_configs', service_id=service_id))
+        return render_template('services/config_edit.html', svc=svc, cfg=cfg)
+
+    @app.route('/services/<int:service_id>/configs/<int:cfg_id>/delete', methods=['POST'])
+    def service_config_delete(service_id, cfg_id):
+        cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+        filename = cfg.filename
+        svc_name = cfg.service.name
+        db.session.delete(cfg)
+        db.session.commit()
+        _audit(AuditLog.ACTION_DELETE, 'service_config', cfg_id, filename,
+               details=f'service={svc_name}')
+        flash(f'Виртуальный конфиг "{filename}" удалён.', 'success')
+        return redirect(url_for('service_configs', service_id=service_id))
 
     # ==================================================================
     # Service Instances
@@ -835,6 +894,34 @@ def create_app():
             'created_at': snap.created_at.strftime('%d.%m.%Y %H:%M:%S'),
             'configs': json.loads(snap.configs_json or '[]'),
         })
+
+    @app.route('/manage/snapshots/<int:snapshot_id>/restore', methods=['POST'])
+    def manage_snapshot_restore(snapshot_id):
+        snap = ConfigSnapshot.query.get_or_404(snapshot_id)
+        inst = db.session.get(ServiceInstance, snap.instance_id)
+        if inst is None:
+            return jsonify({'ok': False, 'error': 'Экземпляр не найден'}), 404
+        configs_data = json.loads(snap.configs_json or '[]')
+        # Replace current InstanceConfig set with snapshot contents
+        InstanceConfig.query.filter_by(instance_id=inst.id).delete()
+        for item in configs_data:
+            db.session.add(InstanceConfig(
+                instance_id=inst.id,
+                filename=item['filename'],
+                filepath=item.get('filepath', ''),
+                content=item.get('content', ''),
+                encoding='utf-8',
+                fetched_at=datetime.utcnow(),
+            ))
+        db.session.commit()
+        client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                     or request.remote_addr or 'unknown')
+        _audit(AuditLog.ACTION_UPDATE, AuditLog.ENTITY_CONFIG,
+               snap.id, f'restore snap#{snap.id}',
+               details=(f'instance={inst.win_service_name} server={inst.server.hostname}'
+                        f' | восстановлено файлов: {len(configs_data)}'),
+               _ip=client_ip)
+        return jsonify({'ok': True, 'restored': len(configs_data)})
 
     # ==================================================================
     # Audit journal

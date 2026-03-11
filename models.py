@@ -87,10 +87,38 @@ class Service(db.Model):
     description  = db.Column(db.String(512))
     created_at   = db.Column(db.DateTime, default=datetime.utcnow)
 
-    instances = db.relationship('ServiceInstance', back_populates='service', cascade='all, delete-orphan')
+    instances      = db.relationship('ServiceInstance', back_populates='service', cascade='all, delete-orphan')
+    virtual_configs = db.relationship('ServiceConfig', back_populates='service', cascade='all, delete-orphan',
+                                      order_by='ServiceConfig.filename')
 
     def __repr__(self):
         return f'<Service {self.name}>'
+
+
+class ServiceConfig(db.Model):
+    """
+    Virtual (service-level) config — общие настройки для всех экземпляров сервиса.
+    Не привязан к конкретному серверу; хранится централизованно.
+    Примеры: connectionmanager.json, logging.json, …
+    """
+    __tablename__ = 'service_configs'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    service_id  = db.Column(db.Integer, db.ForeignKey('services.id'), nullable=False)
+    filename    = db.Column(db.String(256), nullable=False)
+    content     = db.Column(db.Text)
+    description = db.Column(db.String(256))
+    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at  = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    service = db.relationship('Service', back_populates='virtual_configs')
+
+    __table_args__ = (
+        db.UniqueConstraint('service_id', 'filename', name='uq_service_config_filename'),
+    )
+
+    def __repr__(self):
+        return f'<ServiceConfig {self.filename} service={self.service_id}>'
 
 
 class ServiceInstance(db.Model):

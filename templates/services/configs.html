@@ -1,0 +1,75 @@
+{% extends 'base.html' %}
+{% block title %}Виртуальные конфиги — {{ svc.name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('service_list') }}">Сервисы</a></li>
+    <li class="breadcrumb-item active">{{ svc.display_name or svc.name }} — виртуальные конфиги</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h5 class="mb-0">
+    <i class="bi bi-file-earmark-code me-2"></i>
+    Виртуальные конфиги
+    <span class="text-muted fw-normal">/ {{ svc.display_name or svc.name }}</span>
+  </h5>
+  <a href="{{ url_for('service_config_create', service_id=svc.id) }}" class="btn btn-primary btn-sm">
+    <i class="bi bi-plus-lg me-1"></i>Добавить файл
+  </a>
+</div>
+
+<div class="alert alert-info py-2 small">
+  <i class="bi bi-info-circle me-1"></i>
+  Виртуальные конфиги — это общие настройки, применяемые ко <strong>всем экземплярам</strong> сервиса
+  (например, <code>connectionmanager.json</code>, <code>logging.json</code>).
+  Они хранятся централизованно и отображаются на странице каждого экземпляра.
+</div>
+
+{% if svc.virtual_configs %}
+<div class="table-responsive">
+  <table class="table table-hover align-middle">
+    <thead class="table-active">
+      <tr>
+        <th>Файл</th>
+        <th>Описание</th>
+        <th>Обновлён</th>
+        <th>Размер</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for cfg in svc.virtual_configs %}
+      <tr>
+        <td class="font-monospace fw-semibold">{{ cfg.filename }}</td>
+        <td class="text-muted small">{{ cfg.description or '—' }}</td>
+        <td class="text-muted small">{{ cfg.updated_at.strftime('%d.%m.%Y %H:%M') }}</td>
+        <td class="text-muted small">{{ (cfg.content or '') | length }} б</td>
+        <td class="text-end">
+          <a href="{{ url_for('service_config_edit', service_id=svc.id, cfg_id=cfg.id) }}"
+             class="btn btn-sm btn-outline-secondary me-1">
+            <i class="bi bi-pencil"></i>
+          </a>
+          <form method="post"
+                action="{{ url_for('service_config_delete', service_id=svc.id, cfg_id=cfg.id) }}"
+                class="d-inline"
+                onsubmit="return confirm('Удалить виртуальный конфиг «{{ cfg.filename }}»?')">
+            <button class="btn btn-sm btn-outline-danger">
+              <i class="bi bi-trash3"></i>
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="text-center py-5 text-muted">
+  <i class="bi bi-file-earmark-x fs-1 d-block mb-2"></i>
+  Виртуальных конфигов ещё нет.
+  <a href="{{ url_for('service_config_create', service_id=svc.id) }}">Добавить первый?</a>
+</div>
+{% endif %}
+{% endblock %}

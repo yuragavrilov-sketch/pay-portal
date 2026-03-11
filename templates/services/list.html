@@ -35,6 +35,11 @@
         </td>
         <td class="text-muted small">{{ svc.created_at.strftime('%d.%m.%Y') }}</td>
         <td class="text-end">
+          <a href="{{ url_for('service_configs', service_id=svc.id) }}"
+             class="btn btn-sm btn-outline-info me-1" title="Виртуальные конфиги">
+            <i class="bi bi-file-earmark-code"></i>
+            {% if svc.virtual_configs %}<span class="badge bg-info text-dark ms-1">{{ svc.virtual_configs | length }}</span>{% endif %}
+          </a>
           <a href="{{ url_for('service_edit', service_id=svc.id) }}"
              class="btn btn-sm btn-outline-secondary me-1">
             <i class="bi bi-pencil"></i>
