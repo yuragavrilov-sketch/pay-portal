@@ -46,9 +46,16 @@
     <span class="badge bg-primary fs-6 ms-1">{{ current_env.name }}</span>
     {% endif %}
   </h4>
-  <button class="btn btn-sm btn-outline-secondary" onclick="refreshAllStatuses()">
-    <i class="bi bi-arrow-clockwise me-1"></i>Обновить статусы
-  </button>
+  <div class="d-flex gap-2">
+    <button class="btn btn-sm btn-outline-info" onclick="reloadAllCfgBadges()" id="btnReloadCfgs"
+            title="Обновить статус конфигов всех экземпляров">
+      <i class="bi bi-file-earmark-code me-1"></i>Конфиги
+      <i class="bi bi-arrow-clockwise" id="cfg-reload-spin"></i>
+    </button>
+    <button class="btn btn-sm btn-outline-secondary" onclick="refreshAllStatuses()">
+      <i class="bi bi-arrow-clockwise me-1"></i>Статусы
+    </button>
+  </div>
 </div>
 
 {% if not service_groups %}
@@ -129,8 +136,10 @@
       </span>
       <span id="progress-{{ inst.id }}" class="text-info small fst-italic d-none ms-1"></span>
 
-      {# Config version badges (loaded lazily when openCfgMgmt is called) #}
-      <span id="cfg-badges-{{ inst.id }}" class="d-flex gap-1 flex-wrap"></span>
+      {# Config sync badges (auto-loaded on page start) #}
+      <span id="cfg-badges-{{ inst.id }}" class="d-flex gap-1 flex-wrap align-items-center">
+        <span class="text-muted" style="font-size:.7rem;">…</span>
+      </span>
 
       <span class="ms-auto"></span>
 
@@ -476,10 +485,20 @@ async function loadCfgSummary(svcId) {
     const r = await fetch(`/api/services/${svcId}/config-summary`);
     cmSummary = await r.json();
     renderCfgPanel(cmSummary);
-    renderCfgBadgesAll(cmSummary);
+    renderCfgBadgesAll(cmSummary);  // also refresh inline badges
   } catch(e) {
     document.getElementById('cm-loading').innerHTML =
       `<p class="text-danger">Ошибка загрузки: ${escHtml(String(e))}</p>`;
+  }
+}
+
+// After any deploy, reload badges
+function reloadBadgesAfterDeploy() {
+  if (cmSvcId) {
+    fetch(`/api/services/${cmSvcId}/config-summary`)
+      .then(r => r.json())
+      .then(d => renderCfgBadgesAll(d))
+      .catch(() => {});
   }
 }
 
@@ -570,7 +589,10 @@ function renderCfgPanel(data) {
 // ── Render config version badges on instance rows in main page ────────
 function renderCfgBadgesAll(data) {
   if (!data.configs) return;
-  // Build a map: instance_id -> [ {filename, status, version, cfg_id, versions} ]
+  const svcId      = data.service_id;
+  const svcDisplay = data.display_name || '';
+
+  // Build a map: instance_id -> [ {filename, status, version, cfg_id} ]
   const instMap = {};
   for (const cfg of data.configs) {
     for (const inst of cfg.instances) {
@@ -578,30 +600,87 @@ function renderCfgBadgesAll(data) {
       instMap[inst.instance_id].push({
         filename: cfg.filename, cfg_id: cfg.id,
         status: inst.status, version: inst.version,
-        versions: cfg.versions,
-        current_version_id: cfg.current_version_id,
+        env_label: cfg.env_label || '',
       });
     }
   }
+
   for (const [instId, cfgs] of Object.entries(instMap)) {
     const el = document.getElementById('cfg-badges-' + instId);
     if (!el) continue;
-    el.innerHTML = cfgs.map(c => {
+
+    // Count statuses
+    const counts = {synced: 0, overridden: 0, outdated: 0, untracked: 0};
+    cfgs.forEach(c => counts[c.status] = (counts[c.status] || 0) + 1);
+    const total = cfgs.length;
+
+    // Summary badge + per-file chips
+    const summaryBadge =
+      counts.outdated   > 0 ? `<span class="badge bg-danger me-1"   style="font-size:.65rem;" title="${counts.outdated} устарел"><i class="bi bi-exclamation-triangle"></i> ${counts.outdated}/${total}</span>` :
+      counts.overridden > 0 ? `<span class="badge bg-warning text-dark me-1" style="font-size:.65rem;" title="${counts.overridden} изменён вручную"><i class="bi bi-pencil"></i> ${counts.overridden}/${total}</span>` :
+      counts.untracked  > 0 ? `<span class="badge bg-secondary me-1" style="font-size:.65rem;" title="${counts.untracked} не синхронизировано"><i class="bi bi-dash"></i> ${counts.untracked}/${total}</span>` :
+                               `<span class="badge bg-success me-1"  style="font-size:.65rem;" title="Все конфиги актуальны"><i class="bi bi-check-lg"></i> ${total}</span>`;
+
+    const chips = cfgs.map(c => {
       const verLabel = c.version != null ? `v${c.version}` : '—';
       const cls =
-        c.status === 'synced'    ? 'bg-success text-white'   :
-        c.status === 'overridden'? 'bg-warning text-dark'    :
-        c.status === 'outdated'  ? 'bg-danger text-white'    :
-                                   'bg-secondary text-white' ;
+        c.status === 'synced'     ? 'bg-success text-white'  :
+        c.status === 'overridden' ? 'bg-warning text-dark'   :
+        c.status === 'outdated'   ? 'bg-danger text-white'   :
+                                    'bg-secondary text-white';
+      const statusText = {synced:'актуален', overridden:'изменён', outdated:'устарел', untracked:'нет данных'}[c.status] || c.status;
       return `<span class="cfg-ver-badge ${cls}"
-                    title="${escHtml(c.filename)} ${verLabel} — ${c.status}"
-                    onclick="openCfgMgmt(${cmSvcId || data.service_id},
-                             ${JSON.stringify(data.display_name || '')})">
+                    title="${escHtml(c.filename)}${c.env_label ? ' ['+escHtml(c.env_label)+']' : ''} ${verLabel} — ${statusText}"
+                    onclick="openCfgMgmt(${svcId}, ${JSON.stringify(svcDisplay)})">
                 ${escHtml(c.filename.split('.')[0])} ${verLabel}
               </span>`;
     }).join('');
+
+    el.innerHTML = summaryBadge + chips;
   }
 }
+
+// ── Reload all config badges (triggered by button) ────────────────────
+async function reloadAllCfgBadges() {
+  const spin = document.getElementById('cfg-reload-spin');
+  const btn  = document.getElementById('btnReloadCfgs');
+  spin.classList.add('spin');
+  btn.disabled = true;
+  try { await _fetchAllCfgBadges(); } finally {
+    spin.classList.remove('spin');
+    btn.disabled = false;
+  }
+}
+
+// ── Auto-load config badges for all services on page start ────────────
+async function _fetchAllCfgBadges() {
+  const svcIds = [
+    {% for group in service_groups %}
+    {% if group.service.virtual_configs %}{{ group.service.id }},{% endif %}
+    {% endfor %}
+  ];
+  if (!svcIds.length) {
+    document.querySelectorAll('[id^="cfg-badges-"]').forEach(el => {
+      el.innerHTML = '<span class="text-muted small">—</span>';
+    });
+    return;
+  }
+  await Promise.all(svcIds.map(async svcId => {
+    try {
+      const r = await fetch(`/api/services/${svcId}/config-summary`);
+      const d = await r.json();
+      renderCfgBadgesAll(d);
+    } catch {}
+  }));
+  document.querySelectorAll('[id^="cfg-badges-"]').forEach(el => {
+    if (el.innerHTML.includes('…')) {
+      el.innerHTML = '<span class="text-muted small">—</span>';
+    }
+  });
+}
+
+// Auto-load on page start
+_fetchAllCfgBadges();
 
 // ── Progress helpers ──────────────────────────────────────────────────
 function clearProgress() {
@@ -680,6 +759,7 @@ function finalizeDeployProgress(ok, results) {
 
   // Reload config badges (re-query summary)
   if (cmSvcId) loadCfgSummary(cmSvcId);
+  reloadBadgesAfterDeploy();
 }
 
 // ── Deploy ALL instances ──────────────────────────────────────────────

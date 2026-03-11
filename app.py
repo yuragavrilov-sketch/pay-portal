@@ -1415,8 +1415,15 @@ def create_app():
                  'is_current': v.is_current}
                 for v in cfg.versions
             ]
+            # For env-specific configs show only instances in that env
+            if cfg.env_id:
+                relevant = [i for i in svc.instances
+                            if any(e.id == cfg.env_id for e in i.server.environments)]
+            else:
+                relevant = svc.instances
+
             instances_status = []
-            for inst in svc.instances:
+            for inst in relevant:
                 icfg = next((c for c in inst.configs if c.filename == cfg.filename), None)
                 if icfg is None or icfg.source_version_id is None:
                     st, inst_ver_num = 'untracked', None
@@ -1437,6 +1444,8 @@ def create_app():
                 })
             result.append({
                 'id': cfg.id, 'filename': cfg.filename, 'description': cfg.description or '',
+                'env_id': cfg.env_id,
+                'env_label': cfg.environment.name if cfg.environment else '',
                 'current_version': cur.version if cur else None,
                 'current_version_id': cur.id if cur else None,
                 'versions': versions, 'instances': instances_status,
