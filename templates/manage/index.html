@@ -35,6 +35,17 @@
 }
 #cfgMgmtModal .inst-cfg-row { font-size: .8rem; border-top: 1px solid var(--bs-border-color); padding: .35rem .75rem; }
 .deploy-progress-item { font-size: .8rem; }
+/* Diff viewer */
+#diff-table { font-family: monospace; font-size: .8rem; white-space: pre; }
+#diff-table table { border-collapse: collapse; width: 100%; }
+#diff-table td { padding: 1px 8px; vertical-align: top; border: none; }
+#diff-table td.ln { color: #999; text-align: right; user-select: none; min-width: 36px; border-right: 1px solid #dee2e6; background: #f8f9fa; }
+#diff-table tr.del td { background: #ffeef0; }
+#diff-table tr.ins td { background: #e6ffed; }
+#diff-table tr.del td.ln { background: #ffd7dc; }
+#diff-table tr.ins td.ln { background: #cdffd8; }
+.diff-del-bg { background: #ffeef0; }
+.diff-ins-bg { background: #e6ffed; }
 </style>
 {% endblock %}
 
@@ -277,6 +288,45 @@
       </div>
       <div class="modal-body" id="snapDetailBody">
         <p class="text-muted">Загрузка…</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ── Config diff modal ───────────────────────────────────────────── #}
+<div class="modal fade" id="diffModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h5 class="modal-title d-flex align-items-center gap-2">
+          <i class="bi bi-file-diff text-info"></i>
+          <span class="font-monospace" id="diff-title">…</span>
+          <span class="badge bg-secondary" id="diff-host"></span>
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <div id="diff-loading" class="text-center py-5 text-muted">
+          <div class="spinner-border spinner-border-sm me-2"></div>Чтение с сервера…
+        </div>
+        <div id="diff-identical" class="d-none alert alert-success m-3 py-2">
+          <i class="bi bi-check-circle me-1"></i>
+          Файл на сервере совпадает с сохранённым в БД.
+        </div>
+        <div id="diff-error" class="d-none alert alert-danger m-3 py-2"></div>
+        <div id="diff-body" class="d-none">
+          {# Legend #}
+          <div class="d-flex gap-3 px-3 py-2 border-bottom small text-muted">
+            <span><span class="diff-del-bg px-1 rounded">красный</span> — только в БД (удалено на сервере)</span>
+            <span><span class="diff-ins-bg px-1 rounded">зелёный</span> — только на сервере (добавлено)</span>
+            <span class="ms-auto" id="diff-stats"></span>
+          </div>
+          <div id="diff-table" style="overflow:auto;max-height:65vh;"></div>
+        </div>
+      </div>
+      <div class="modal-footer py-2">
+        <span class="text-muted small me-auto" id="diff-filepath" style="font-family:monospace;font-size:.78rem;"></span>
+        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Закрыть</button>
       </div>
     </div>
   </div>
@@ -539,6 +589,11 @@ function renderCfgPanel(data) {
         <span class="badge bg-secondary ms-1" style="font-size:.65rem;">${verLabel}</span>
         ${stIcon[inst.status] || stIcon.untracked}
         <span class="ms-auto d-flex gap-1">
+          <button class="btn btn-xs btn-outline-info" style="font-size:.72rem;padding:1px 7px;"
+                  onclick="showDiff(${inst.instance_id}, ${JSON.stringify(cfg.filename)})"
+                  title="Сравнить с реальным файлом на сервере">
+            <i class="bi bi-file-diff"></i> Diff
+          </button>
           <button class="btn btn-xs btn-outline-primary" style="font-size:.72rem;padding:1px 7px;"
                   onclick="deployToInst(${inst.instance_id}, ${cfg.id},
                             document.getElementById('ver-sel-${cfg.id}').value, false)"
@@ -861,6 +916,159 @@ async function deployToInst(instId, cfgId, verId, doRestart) {
 document.getElementById('cfgMgmtModal').addEventListener('hide.bs.modal', () => {
   if (cmDeployEs) { cmDeployEs.close(); cmDeployEs = null; }
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Config Diff Modal
+// ═══════════════════════════════════════════════════════════════════════
+
+let diffModalInst = null;
+function getDiffModal() {
+  if (!diffModalInst) diffModalInst = new bootstrap.Modal(document.getElementById('diffModal'));
+  return diffModalInst;
+}
+
+async function showDiff(instanceId, filename) {
+  // Reset UI
+  document.getElementById('diff-title').textContent    = filename;
+  document.getElementById('diff-host').textContent     = '';
+  document.getElementById('diff-filepath').textContent = '';
+  document.getElementById('diff-loading').classList.remove('d-none');
+  document.getElementById('diff-identical').classList.add('d-none');
+  document.getElementById('diff-error').classList.add('d-none');
+  document.getElementById('diff-body').classList.add('d-none');
+  document.getElementById('diff-table').innerHTML = '';
+  document.getElementById('diff-stats').textContent = '';
+  getDiffModal().show();
+
+  try {
+    const r = await fetch(
+      `/manage/instances/${instanceId}/config-diff?filename=${encodeURIComponent(filename)}`
+    );
+    const d = await r.json();
+    document.getElementById('diff-loading').classList.add('d-none');
+
+    if (!d.ok) {
+      const el = document.getElementById('diff-error');
+      el.textContent = d.error || 'Ошибка';
+      el.classList.remove('d-none');
+      return;
+    }
+
+    document.getElementById('diff-host').textContent     = d.hostname || '';
+    document.getElementById('diff-filepath').textContent = d.filepath || '';
+
+    if (d.identical) {
+      document.getElementById('diff-identical').classList.remove('d-none');
+      return;
+    }
+
+    // Build diff
+    const storedLines = (d.stored || '').split('\n');
+    const liveLines   = (d.live   || '').split('\n');
+    const diff = computeDiff(storedLines, liveLines);
+    renderDiffTable(diff);
+    document.getElementById('diff-body').classList.remove('d-none');
+  } catch(e) {
+    document.getElementById('diff-loading').classList.add('d-none');
+    const el = document.getElementById('diff-error');
+    el.textContent = 'Ошибка запроса: ' + e;
+    el.classList.remove('d-none');
+  }
+}
+
+// ── LCS-based unified diff ────────────────────────────────────────────
+function computeDiff(aLines, bLines) {
+  const m = aLines.length, n = bLines.length;
+  // For large files skip LCS, show raw blocks
+  if (m > 800 || n > 800) {
+    const rows = [];
+    const maxL = Math.max(m, n);
+    for (let i = 0; i < maxL; i++) {
+      if (i < m && i < n) {
+        if (aLines[i] === bLines[i]) rows.push({t: '=', a: aLines[i], b: bLines[i], la: i+1, lb: i+1});
+        else {
+          rows.push({t: '-', a: aLines[i], la: i+1});
+          rows.push({t: '+', b: bLines[i], lb: i+1});
+        }
+      } else if (i < m) rows.push({t: '-', a: aLines[i], la: i+1});
+      else               rows.push({t: '+', b: bLines[i], lb: i+1});
+    }
+    return rows;
+  }
+
+  // DP LCS table
+  const dp = Array.from({length: m+1}, () => new Int32Array(n+1));
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = aLines[i-1] === bLines[j-1]
+        ? dp[i-1][j-1] + 1
+        : Math.max(dp[i-1][j], dp[i][j-1]);
+
+  // Backtrack
+  const ops = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && aLines[i-1] === bLines[j-1]) {
+      ops.push({t: '=', a: aLines[i-1], la: i, lb: j});
+      i--; j--;
+    } else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) {
+      ops.push({t: '+', b: bLines[j-1], lb: j});
+      j--;
+    } else {
+      ops.push({t: '-', a: aLines[i-1], la: i});
+      i--;
+    }
+  }
+  return ops.reverse();
+}
+
+// ── Render diff as HTML table ─────────────────────────────────────────
+function renderDiffTable(diff) {
+  const CONTEXT = 4;  // lines around changes
+  let dels = 0, ins = 0;
+
+  // Mark changed lines
+  const changes = new Set();
+  diff.forEach((op, idx) => { if (op.t !== '=') changes.add(idx); });
+
+  // Determine visible rows (changed + context)
+  const visible = new Set();
+  diff.forEach((op, idx) => {
+    if (op.t !== '=') {
+      for (let k = Math.max(0, idx - CONTEXT); k <= Math.min(diff.length-1, idx + CONTEXT); k++)
+        visible.add(k);
+    }
+  });
+
+  let rows = '';
+  let lastVisible = -1;
+  diff.forEach((op, idx) => {
+    if (!visible.has(idx)) { lastVisible = idx; return; }
+    if (lastVisible >= 0 && lastVisible < idx - 1) {
+      rows += `<tr><td class="ln">…</td><td class="ln">…</td><td class="text-muted">@@ skipped @@</td></tr>`;
+    }
+    lastVisible = -2; // mark as consecutive
+
+    const la = op.la ?? '';
+    const lb = op.lb ?? '';
+    if (op.t === '=') {
+      rows += `<tr><td class="ln">${la}</td><td class="ln">${lb}</td><td>${escHtml(op.a)}</td></tr>`;
+    } else if (op.t === '-') {
+      dels++;
+      rows += `<tr class="del"><td class="ln">${la}</td><td class="ln"></td><td>−&nbsp;${escHtml(op.a)}</td></tr>`;
+    } else {
+      ins++;
+      rows += `<tr class="ins"><td class="ln"></td><td class="ln">${lb}</td><td>+&nbsp;${escHtml(op.b)}</td></tr>`;
+    }
+  });
+
+  if (!rows) rows = '<tr><td colspan="3" class="text-muted p-3">Различий нет</td></tr>';
+
+  document.getElementById('diff-table').innerHTML =
+    `<table><tbody>${rows}</tbody></table>`;
+  document.getElementById('diff-stats').textContent =
+    `−${dels} / +${ins} строк`;
+}
 
 
 // ═══════════════════════════════════════════════════════════════════════

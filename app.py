@@ -1782,6 +1782,51 @@ def create_app():
                                result=result, search=search)
 
     # ==================================================================
+    # ==================================================================
+    # Config diff: stored-in-DB vs live-on-server
+    # ==================================================================
+
+    @app.route('/manage/instances/<int:instance_id>/config-diff')
+    def manage_instance_config_diff(instance_id):
+        """
+        Читает реальный файл с сервера, сравнивает с сохранённым в БД.
+        GET ?filename=xxx
+        Возвращает: {ok, filename, filepath, stored, live, encoding, identical}
+        """
+        inst = ServiceInstance.query.get_or_404(instance_id)
+        filename = request.args.get('filename', '').strip()
+        if not filename:
+            return jsonify({'ok': False, 'error': 'filename required'}), 400
+
+        icfg = next((c for c in inst.configs if c.filename == filename), None)
+        stored   = icfg.content   if icfg else None
+        filepath = icfg.filepath  if icfg else None
+
+        if not filepath and inst.config_dir:
+            filepath = inst.config_dir.rstrip('\\') + '\\' + filename
+
+        if not filepath:
+            return jsonify({'ok': False, 'error': 'filepath не задан для этого конфига'})
+
+        live_content, encoding = winrm_utils.fetch_file_content(inst.server, filepath)
+        if live_content is None:
+            return jsonify({'ok': False,
+                            'error': f'Не удалось прочитать файл с сервера ({filepath})'})
+
+        identical = (stored or '').strip() == live_content.strip()
+        return jsonify({
+            'ok':        True,
+            'filename':  filename,
+            'filepath':  filepath,
+            'stored':    stored,
+            'live':      live_content,
+            'encoding':  encoding,
+            'identical': identical,
+            'win_name':  inst.win_service_name,
+            'hostname':  inst.server.hostname,
+        })
+
+    # ==================================================================
     # Config Scan — фоновый скан конфигов экземпляров
     # ==================================================================
 
