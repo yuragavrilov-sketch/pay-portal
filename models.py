@@ -109,19 +109,24 @@ class ServiceConfig(db.Model):
     """
     Virtual (service-level) config — общие настройки для всех экземпляров сервиса.
     Не привязан к конкретному серверу; хранится централизованно.
+    env_id=NULL → базовый конфиг (для всех окружений).
+    env_id=<id>  → конфиг для конкретного окружения (env-override).
     Примеры: connectionmanager.json, logging.json, …
     """
     __tablename__ = 'service_configs'
 
     id          = db.Column(db.Integer, primary_key=True)
     service_id  = db.Column(db.Integer, db.ForeignKey('services.id'), nullable=False)
+    env_id      = db.Column(db.Integer, db.ForeignKey('environments.id', ondelete='SET NULL'),
+                            nullable=True)
     filename    = db.Column(db.String(256), nullable=False)
     content     = db.Column(db.Text)
     description = db.Column(db.String(256))
     created_at  = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at  = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    service  = db.relationship('Service', back_populates='virtual_configs')
+    service     = db.relationship('Service', back_populates='virtual_configs')
+    environment = db.relationship('Environment', foreign_keys=[env_id])
     versions = db.relationship(
         'ServiceConfigVersion',
         back_populates='service_config',
@@ -139,11 +144,14 @@ class ServiceConfig(db.Model):
         return v.version if v else None
 
     __table_args__ = (
-        db.UniqueConstraint('service_id', 'filename', name='uq_service_config_filename'),
+        # Уникальность: один конфиг с данным именем на (сервис, env).
+        # Для NULL env используем отдельный partial index в _migrate_db.
+        db.UniqueConstraint('service_id', 'filename', 'env_id',
+                            name='uq_service_config_filename_env'),
     )
 
     def __repr__(self):
-        return f'<ServiceConfig {self.filename} service={self.service_id}>'
+        return f'<ServiceConfig {self.filename} service={self.service_id} env={self.env_id}>'
 
 
 class ServiceConfigVersion(db.Model):

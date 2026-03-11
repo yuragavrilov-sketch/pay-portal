@@ -81,7 +81,8 @@ def _migrate_db(app):
     """Idempotent: добавляет новые колонки в существующие таблицы (PostgreSQL)."""
     with app.app_context():
         with db.engine.connect() as conn:
-            checks = [
+            # --- Column migrations ---
+            col_checks = [
                 (
                     "instance_configs", "source_version_id",
                     "ALTER TABLE instance_configs "
@@ -93,14 +94,68 @@ def _migrate_db(app):
                     "ALTER TABLE instance_configs "
                     "ADD COLUMN is_overridden BOOLEAN NOT NULL DEFAULT FALSE",
                 ),
+                (
+                    "service_configs", "env_id",
+                    "ALTER TABLE service_configs "
+                    "ADD COLUMN env_id INTEGER "
+                    "REFERENCES environments(id) ON DELETE SET NULL",
+                ),
             ]
-            for table, column, ddl in checks:
+            for table, column, ddl in col_checks:
                 row = conn.execute(text(
                     "SELECT column_name FROM information_schema.columns "
                     "WHERE table_name=:t AND column_name=:c"
                 ), {"t": table, "c": column}).fetchone()
                 if not row:
                     conn.execute(text(ddl))
+
+            # --- Constraint migrations for service_configs ---
+            # Drop old unique constraint (service_id, filename) if it exists
+            old_con = conn.execute(text(
+                "SELECT constraint_name FROM information_schema.table_constraints "
+                "WHERE table_name='service_configs' "
+                "AND constraint_name='uq_service_config_filename'"
+            )).fetchone()
+            if old_con:
+                conn.execute(text(
+                    "ALTER TABLE service_configs DROP CONSTRAINT uq_service_config_filename"
+                ))
+
+            # Also drop new-style constraint if it already exists (idempotent)
+            new_con = conn.execute(text(
+                "SELECT constraint_name FROM information_schema.table_constraints "
+                "WHERE table_name='service_configs' "
+                "AND constraint_name='uq_service_config_filename_env'"
+            )).fetchone()
+            if new_con:
+                conn.execute(text(
+                    "ALTER TABLE service_configs DROP CONSTRAINT uq_service_config_filename_env"
+                ))
+
+            # Partial unique index: only one base (env_id IS NULL) config per (service, filename)
+            idx_null = conn.execute(text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE tablename='service_configs' "
+                "AND indexname='uq_svc_cfg_filename_global'"
+            )).fetchone()
+            if not idx_null:
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX uq_svc_cfg_filename_global "
+                    "ON service_configs(service_id, filename) WHERE env_id IS NULL"
+                ))
+
+            # Partial unique index: one config per (service, filename, env) for env-specific configs
+            idx_env = conn.execute(text(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE tablename='service_configs' "
+                "AND indexname='uq_svc_cfg_filename_env'"
+            )).fetchone()
+            if not idx_env:
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX uq_svc_cfg_filename_env "
+                    "ON service_configs(service_id, filename, env_id) WHERE env_id IS NOT NULL"
+                ))
+
             conn.commit()
 
 
@@ -451,17 +506,26 @@ def create_app():
     @app.route('/services/<int:service_id>/configs')
     def service_configs(service_id):
         svc = Service.query.get_or_404(service_id)
-        # Сводка синхронизации: для каждого ServiceConfig считаем сколько экземпляров in-sync
+        env_filter_id = request.args.get('env_id', type=int)
+
+        # Build sync summaries per config, instances filtered by env if specified
         sync_summaries = {}
         for cfg in svc.virtual_configs:
             cur = cfg.current_version
-            total = len(svc.instances)
+            # Instances relevant for this config: if config is env-specific, only that env
+            target_env_id = cfg.env_id
+            if target_env_id:
+                relevant = [i for i in svc.instances
+                            if any(e.id == target_env_id for e in i.server.environments)]
+            else:
+                relevant = svc.instances
+            total = len(relevant)
             if not cur:
                 sync_summaries[cfg.id] = {'synced': 0, 'overridden': 0, 'outdated': 0,
                                           'untracked': total, 'total': total, 'version': None}
                 continue
             counts = {'synced': 0, 'overridden': 0, 'outdated': 0, 'untracked': 0}
-            for inst in svc.instances:
+            for inst in relevant:
                 icfg = next((c for c in inst.configs if c.filename == cfg.filename), None)
                 if icfg is None or icfg.source_version_id is None:
                     counts['untracked'] += 1
@@ -474,25 +538,56 @@ def create_app():
             counts['total'] = total
             counts['version'] = cur.version
             sync_summaries[cfg.id] = counts
-        return render_template('services/configs.html', svc=svc, sync_summaries=sync_summaries)
+
+        environments = Environment.query.order_by(Environment.name).all()
+        # Collect env_ids that actually have configs for this service
+        used_env_ids = {cfg.env_id for cfg in svc.virtual_configs}
+
+        # Filter configs for display
+        if env_filter_id == 0:   # 0 = base (env_id IS NULL)
+            display_configs = [c for c in svc.virtual_configs if c.env_id is None]
+        elif env_filter_id:
+            display_configs = [c for c in svc.virtual_configs if c.env_id == env_filter_id]
+        else:
+            display_configs = svc.virtual_configs
+
+        return render_template(
+            'services/configs.html',
+            svc=svc,
+            sync_summaries=sync_summaries,
+            environments=environments,
+            used_env_ids=used_env_ids,
+            env_filter_id=env_filter_id,
+            display_configs=display_configs,
+        )
 
     @app.route('/services/<int:service_id>/configs/create', methods=['GET', 'POST'])
     def service_config_create(service_id):
         svc = Service.query.get_or_404(service_id)
+        environments = Environment.query.order_by(Environment.name).all()
         if request.method == 'POST':
             filename = request.form['filename'].strip()
-            if ServiceConfig.query.filter_by(service_id=service_id, filename=filename).first():
-                flash(f'Файл "{filename}" уже существует для этого сервиса.', 'danger')
+            raw_env  = request.form.get('env_id', '').strip()
+            env_id   = int(raw_env) if raw_env else None
+
+            # Unique check: one base config and one per-env config per (service, filename)
+            dup = ServiceConfig.query.filter_by(
+                service_id=service_id, filename=filename, env_id=env_id
+            ).first()
+            if dup:
+                env_label = f' (env #{env_id})' if env_id else ' (базовый)'
+                flash(f'Файл "{filename}"{env_label} уже существует для этого сервиса.', 'danger')
             else:
                 content = request.form.get('content', '')
                 cfg = ServiceConfig(
                     service_id=service_id,
+                    env_id=env_id,
                     filename=filename,
                     description=request.form.get('description', '').strip(),
                     content=content,
                 )
                 db.session.add(cfg)
-                db.session.flush()  # получаем cfg.id
+                db.session.flush()
 
                 client_ip = (
                     request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
@@ -509,19 +604,42 @@ def create_app():
                 db.session.add(ver)
                 db.session.commit()
 
+                env_name = cfg.environment.name if cfg.environment else 'все env'
                 _audit(AuditLog.ACTION_CREATE, 'service_config', cfg.id, filename,
-                       details=f'service={svc.name} v1')
+                       details=f'service={svc.name} env={env_name} v1')
                 flash(f'Виртуальный конфиг "{filename}" создан (v1).', 'success')
                 return redirect(url_for('service_configs', service_id=service_id))
-        return render_template('services/config_edit.html', svc=svc, cfg=None)
+        return render_template('services/config_edit.html', svc=svc, cfg=None,
+                               environments=environments)
 
     @app.route('/services/<int:service_id>/configs/<int:cfg_id>/edit', methods=['GET', 'POST'])
     def service_config_edit(service_id, cfg_id):
         svc = Service.query.get_or_404(service_id)
         cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
+        environments = Environment.query.order_by(Environment.name).all()
         if request.method == 'POST':
             new_content = request.form.get('content', '')
-            cfg.filename    = request.form['filename'].strip()
+            new_filename = request.form['filename'].strip()
+            raw_env = request.form.get('env_id', '').strip()
+            new_env_id = int(raw_env) if raw_env else None
+
+            # Check uniqueness only if filename or env_id changed
+            if new_filename != cfg.filename or new_env_id != cfg.env_id:
+                dup = ServiceConfig.query.filter(
+                    ServiceConfig.service_id == service_id,
+                    ServiceConfig.filename   == new_filename,
+                    ServiceConfig.env_id     == new_env_id,
+                    ServiceConfig.id         != cfg.id,
+                ).first()
+                if dup:
+                    env_label = f' (env #{new_env_id})' if new_env_id else ' (базовый)'
+                    flash(f'Файл "{new_filename}"{env_label} уже существует для этого сервиса.',
+                          'danger')
+                    return render_template('services/config_edit.html', svc=svc, cfg=cfg,
+                                           environments=environments)
+
+            cfg.filename    = new_filename
+            cfg.env_id      = new_env_id
             cfg.description = request.form.get('description', '').strip()
             cfg.content     = new_content
             cfg.updated_at  = datetime.utcnow()
@@ -530,7 +648,6 @@ def create_app():
                 request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
                 or request.remote_addr or 'unknown'
             )
-            # Снимаем флаг is_current у всех предыдущих версий
             ServiceConfigVersion.query.filter_by(
                 service_config_id=cfg.id
             ).update({'is_current': False})
@@ -547,11 +664,13 @@ def create_app():
             db.session.add(ver)
             db.session.commit()
 
+            env_name = cfg.environment.name if cfg.environment else 'все env'
             _audit(AuditLog.ACTION_UPDATE, 'service_config', cfg.id, cfg.filename,
-                   details=f'service={svc.name} v{next_v}')
+                   details=f'service={svc.name} env={env_name} v{next_v}')
             flash(f'Конфиг сохранён как версия v{next_v}.', 'success')
             return redirect(url_for('service_configs', service_id=service_id))
-        return render_template('services/config_edit.html', svc=svc, cfg=cfg)
+        return render_template('services/config_edit.html', svc=svc, cfg=cfg,
+                               environments=environments)
 
     @app.route('/services/<int:service_id>/configs/<int:cfg_id>/delete', methods=['POST'])
     def service_config_delete(service_id, cfg_id):
@@ -610,9 +729,16 @@ def create_app():
         svc = Service.query.get_or_404(service_id)
         cfg = ServiceConfig.query.filter_by(id=cfg_id, service_id=service_id).first_or_404()
         environments = Environment.query.order_by(Environment.name).all()
-        # Синхронизируем экземпляры с их статусом
+
+        # For env-specific configs, pre-filter instances to that env
+        if cfg.env_id:
+            relevant_instances = [i for i in svc.instances
+                                  if any(e.id == cfg.env_id for e in i.server.environments)]
+        else:
+            relevant_instances = svc.instances
+
         icfg_map: dict = {}
-        for inst in svc.instances:
+        for inst in relevant_instances:
             icfg = next((c for c in inst.configs if c.filename == cfg.filename), None)
             cur  = cfg.current_version
             if icfg is None or icfg.source_version_id is None:
@@ -627,6 +753,7 @@ def create_app():
         return render_template('services/config_push.html',
                                svc=svc, cfg=cfg,
                                environments=environments,
+                               relevant_instances=relevant_instances,
                                instance_statuses=icfg_map)
 
     @app.route('/services/<int:service_id>/configs/<int:cfg_id>/push', methods=['POST'])
@@ -638,13 +765,17 @@ def create_app():
         if not cur_ver:
             return jsonify({'ok': False, 'error': 'Нет активной версии для применения'}), 400
 
-        data      = request.get_json(silent=True) or {}
-        env_id    = data.get('env_id')
-        force     = bool(data.get('force', False))
+        data   = request.get_json(silent=True) or {}
+        force  = bool(data.get('force', False))
+        # env_id: from request, or fall back to config's own env scope
+        req_env_id = data.get('env_id')
+        effective_env_id = req_env_id or cfg.env_id
 
         q_inst = ServiceInstance.query.filter_by(service_id=service_id).join(Server)
-        if env_id:
-            q_inst = q_inst.join(Server.environments).filter(Environment.id == int(env_id))
+        if effective_env_id:
+            q_inst = (q_inst
+                      .join(Server.environments)
+                      .filter(Environment.id == int(effective_env_id)))
         instances = q_inst.all()
 
         if not instances:
@@ -828,85 +959,103 @@ def create_app():
             client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
                          or request.remote_addr or 'unknown')
 
-            def worker():
-                created = 0
-                try:
-                    with app.app_context():
-                        for idx, item in enumerate(items):
-                            srv_id   = item.get('server_id')
-                            win_name = str(item.get('win_service_name', '')).strip()
-                            svc_id   = item.get('service_id')
-                            if not win_name or not srv_id:
-                                q.put({'type': 'item_done', 'index': idx,
-                                       'ok': False, 'win_name': win_name,
-                                       'hostname': '', 'message': 'Неверные параметры'})
-                                continue
+            def process_one_instance(idx_item):
+                idx, item = idx_item
+                with app.app_context():
+                    srv_id   = item.get('server_id')
+                    win_name = str(item.get('win_service_name', '')).strip()
+                    svc_id   = item.get('service_id')
+                    if not win_name or not srv_id:
+                        r = {'index': idx, 'ok': False, 'win_name': win_name,
+                             'hostname': '', 'message': 'Неверные параметры'}
+                        q.put({'type': 'item_done', **r})
+                        return r
 
-                            server = db.session.get(Server, int(srv_id))
-                            if not server:
-                                q.put({'type': 'item_done', 'index': idx,
-                                       'ok': False, 'win_name': win_name,
-                                       'hostname': str(srv_id), 'message': 'Сервер не найден'})
-                                continue
+                    server = db.session.get(Server, int(srv_id))
+                    if not server:
+                        r = {'index': idx, 'ok': False, 'win_name': win_name,
+                             'hostname': str(srv_id), 'message': 'Сервер не найден'}
+                        q.put({'type': 'item_done', **r})
+                        return r
 
+                    q.put({'type': 'item_progress', 'index': idx,
+                           'win_name': win_name, 'hostname': server.hostname,
+                           'message': 'Получаю информацию о сервисе…'})
+                    try:
+                        info = winrm_utils.get_service_info(server, win_name)
+                        exe_path   = info.get('exe_path') or ''
+                        config_dir = winrm_utils.infer_config_dir(exe_path) if exe_path else ''
+
+                        inst = ServiceInstance(
+                            server_id=server.id,
+                            service_id=int(svc_id),
+                            win_service_name=win_name,
+                            exe_path=exe_path,
+                            config_dir=config_dir,
+                            status=info.get('status', 'unknown'),
+                            last_status_check=datetime.utcnow(),
+                        )
+                        db.session.add(inst)
+                        db.session.flush()
+
+                        cfg_count = 0
+                        if config_dir:
                             q.put({'type': 'item_progress', 'index': idx,
                                    'win_name': win_name, 'hostname': server.hostname,
-                                   'message': 'Получаю информацию о сервисе…'})
+                                   'message': 'Загружаю конфиги…'})
+                            for cf in winrm_utils.fetch_all_configs(server, config_dir):
+                                db.session.add(InstanceConfig(
+                                    instance_id=inst.id,
+                                    filename=cf['filename'],
+                                    filepath=cf['filepath'],
+                                    content=cf['content'],
+                                    encoding=cf['encoding'],
+                                    fetched_at=cf['fetched_at'],
+                                ))
+                                cfg_count += 1
+
+                        db.session.commit()
+                        _audit(AuditLog.ACTION_CREATE, AuditLog.ENTITY_INSTANCE,
+                               inst.id, win_name,
+                               details=(f'server={server.hostname}'
+                                        f' config_dir={config_dir!r}'
+                                        f' configs={cfg_count}'),
+                               result=AuditLog.RESULT_WARNING if info.get('error') else AuditLog.RESULT_OK,
+                               _ip=client_ip)
+                        msg = info.get('error') or f'Конфигов: {cfg_count}'
+                        r = {'index': idx, 'ok': True,
+                             'win_name': win_name, 'hostname': server.hostname, 'message': msg}
+                        q.put({'type': 'item_done', **r})
+                        return r
+                    except Exception as exc:
+                        db.session.rollback()
+                        r = {'index': idx, 'ok': False,
+                             'win_name': win_name, 'hostname': server.hostname, 'message': str(exc)}
+                        q.put({'type': 'item_done', **r})
+                        return r
+
+            def worker():
+                results: list[dict] = []
+                try:
+                    max_w = max(1, min(len(items), 8))
+                    with ThreadPoolExecutor(max_workers=max_w) as pool:
+                        futures = {pool.submit(process_one_instance, (idx, item)): idx
+                                   for idx, item in enumerate(items)}
+                        for future in as_completed(futures):
                             try:
-                                info = winrm_utils.get_service_info(server, win_name)
-                                exe_path   = info.get('exe_path') or ''
-                                config_dir = winrm_utils.infer_config_dir(exe_path) if exe_path else ''
-
-                                inst = ServiceInstance(
-                                    server_id=server.id,
-                                    service_id=int(svc_id),
-                                    win_service_name=win_name,
-                                    exe_path=exe_path,
-                                    config_dir=config_dir,
-                                    status=info.get('status', 'unknown'),
-                                    last_status_check=datetime.utcnow(),
-                                )
-                                db.session.add(inst)
-                                db.session.flush()
-
-                                cfg_count = 0
-                                if config_dir:
-                                    q.put({'type': 'item_progress', 'index': idx,
-                                           'win_name': win_name, 'hostname': server.hostname,
-                                           'message': 'Загружаю конфиги…'})
-                                    for cf in winrm_utils.fetch_all_configs(server, config_dir):
-                                        db.session.add(InstanceConfig(
-                                            instance_id=inst.id,
-                                            filename=cf['filename'],
-                                            filepath=cf['filepath'],
-                                            content=cf['content'],
-                                            encoding=cf['encoding'],
-                                            fetched_at=cf['fetched_at'],
-                                        ))
-                                        cfg_count += 1
-
-                                db.session.commit()
-                                _audit(AuditLog.ACTION_CREATE, AuditLog.ENTITY_INSTANCE,
-                                       inst.id, win_name,
-                                       details=(f'server={server.hostname}'
-                                                f' config_dir={config_dir!r}'
-                                                f' configs={cfg_count}'),
-                                       result=AuditLog.RESULT_WARNING if info.get('error') else AuditLog.RESULT_OK,
-                                       _ip=client_ip)
-                                created += 1
-                                msg = info.get('error') or f'Конфигов: {cfg_count}'
-                                q.put({'type': 'item_done', 'index': idx, 'ok': True,
-                                       'win_name': win_name, 'hostname': server.hostname,
-                                       'message': msg})
+                                results.append(future.result())
                             except Exception as exc:
-                                db.session.rollback()
-                                q.put({'type': 'item_done', 'index': idx, 'ok': False,
-                                       'win_name': win_name, 'hostname': server.hostname,
-                                       'message': str(exc)})
+                                idx = futures[future]
+                                r = {'index': idx, 'ok': False,
+                                     'win_name': '', 'hostname': '', 'message': str(exc)}
+                                results.append(r)
+                                q.put({'type': 'item_done', **r})
 
-                        q.put({'type': 'done_all', 'ok': True, 'created': created,
-                               'total': len(items)})
+                    created = sum(1 for r in results if r.get('ok'))
+                    q.put({'type': 'done_all', 'ok': True, 'created': created,
+                           'total': len(items)})
                 except Exception as exc:
+                    created = sum(1 for r in results if r.get('ok'))
                     q.put({'type': 'done_all', 'ok': False, 'created': created,
                            'total': len(items), 'error': str(exc)})
                 finally:
@@ -1622,6 +1771,117 @@ def create_app():
         return render_template('audit/list.html', pagination=pagination,
                                action=action, entity=entity,
                                result=result, search=search)
+
+    # ==================================================================
+    # Config Scan — фоновый скан конфигов экземпляров
+    # ==================================================================
+
+    @app.route('/instances/scan-configs', methods=['POST'])
+    def instance_scan_configs():
+        """
+        Запускает параллельный скан конфигов всех (или выбранных по env) экземпляров.
+        Сравнивает актуальное содержимое на серверах с сохранённым в БД.
+        Возвращает task_id для SSE-стрима.
+        """
+        data = request.get_json(silent=True) or {}
+        env_id = data.get('env_id')
+
+        q_inst = ServiceInstance.query.join(Server)
+        if env_id:
+            q_inst = q_inst.join(Server.environments).filter(Environment.id == int(env_id))
+        instances = q_inst.all()
+
+        if not instances:
+            return jsonify({'ok': False, 'error': 'Нет экземпляров для сканирования'}), 400
+
+        task_id = str(uuid.uuid4())
+        scan_q: queue.Queue = queue.Queue()
+        _tasks[task_id] = {'q': scan_q, 'done': False}
+
+        inst_ids = [i.id for i in instances]
+
+        def scan_one(iid: int) -> dict:
+            with app.app_context():
+                inst_w = db.session.get(ServiceInstance, iid)
+                if inst_w is None:
+                    r = {'instance_id': iid, 'ok': False, 'hostname': '?',
+                         'win_name': '?', 'message': 'Не найден', 'diffs': []}
+                    scan_q.put({'type': 'scan_done', **r})
+                    return r
+
+                hostname = inst_w.server.hostname
+                win_name = inst_w.win_service_name
+                scan_q.put({'type': 'scan_progress', 'instance_id': iid,
+                            'message': f'[{hostname}] {win_name}: чтение конфигов…'})
+
+                if not inst_w.config_dir:
+                    r = {'instance_id': iid, 'ok': True, 'hostname': hostname,
+                         'win_name': win_name, 'message': 'config_dir не задан', 'diffs': []}
+                    scan_q.put({'type': 'scan_done', **r})
+                    return r
+
+                try:
+                    live_files = winrm_utils.fetch_all_configs(inst_w.server, inst_w.config_dir)
+                except Exception as exc:
+                    r = {'instance_id': iid, 'ok': False, 'hostname': hostname,
+                         'win_name': win_name, 'message': f'Ошибка WinRM: {exc}', 'diffs': []}
+                    scan_q.put({'type': 'scan_done', **r})
+                    return r
+
+                stored = {c.filename: c.content or '' for c in inst_w.configs}
+                live   = {f['filename']: f['content'] or '' for f in live_files}
+
+                diffs = []
+                all_names = set(stored) | set(live)
+                for fname in sorted(all_names):
+                    s = stored.get(fname)
+                    l = live.get(fname)
+                    if s is None:
+                        diffs.append({'file': fname, 'status': 'new_on_server'})
+                    elif l is None:
+                        diffs.append({'file': fname, 'status': 'missing_on_server'})
+                    elif s.strip() != l.strip():
+                        diffs.append({'file': fname, 'status': 'changed'})
+                    else:
+                        diffs.append({'file': fname, 'status': 'ok'})
+
+                changed = sum(1 for d in diffs if d['status'] != 'ok')
+                msg = f'{len(diffs)} файл(ов), изменено: {changed}' if diffs else 'нет конфигов'
+                r = {'instance_id': iid, 'ok': True, 'hostname': hostname,
+                     'win_name': win_name, 'message': msg,
+                     'diffs': diffs, 'changed': changed}
+                scan_q.put({'type': 'scan_done', **r})
+                return r
+
+        def worker():
+            results: list[dict] = []
+            try:
+                max_w = max(1, min(len(inst_ids), 8))
+                with ThreadPoolExecutor(max_workers=max_w) as pool:
+                    futures = {pool.submit(scan_one, iid): iid for iid in inst_ids}
+                    for future in as_completed(futures):
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            iid = futures[future]
+                            r = {'instance_id': iid, 'ok': False,
+                                 'hostname': '?', 'win_name': '?',
+                                 'message': str(exc), 'diffs': []}
+                            results.append(r)
+                            scan_q.put({'type': 'scan_done', **r})
+
+                total_changed = sum(r.get('changed', 0) for r in results)
+                scan_q.put({'type': 'done_all', 'ok': True,
+                            'total': len(results), 'total_changed': total_changed})
+            except Exception as exc:
+                scan_q.put({'type': 'done_all', 'ok': False, 'error': str(exc),
+                            'total': len(results), 'total_changed': 0})
+            finally:
+                if task_id in _tasks:
+                    _tasks[task_id]['done'] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({'task_id': task_id, 'total': len(inst_ids)})
 
     return app
 

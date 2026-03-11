@@ -26,6 +26,13 @@
   {% if cfg.current_version_number %}
   <span class="badge bg-primary ms-1">v{{ cfg.current_version_number }}</span>
   {% endif %}
+  {% if cfg.environment %}
+  <span class="badge bg-warning text-dark ms-1">
+    <i class="bi bi-tag me-1"></i>{{ cfg.environment.name }}
+  </span>
+  {% else %}
+  <span class="badge bg-secondary ms-1"><i class="bi bi-globe2 me-1"></i>все env</span>
+  {% endif %}
 </h5>
 
 {% if not cfg.current_version %}
@@ -45,9 +52,17 @@
         <select id="sel-env" class="form-select">
           <option value="">Все окружения</option>
           {% for env in environments %}
-          <option value="{{ env.id }}">{{ env.name }}{% if env.description %} — {{ env.description }}{% endif %}</option>
+          <option value="{{ env.id }}"
+            {% if cfg.env_id == env.id %}selected{% endif %}>
+            {{ env.name }}{% if env.description %} — {{ env.description }}{% endif %}
+          </option>
           {% endfor %}
         </select>
+        {% if cfg.env_id %}
+        <div class="form-text text-warning">
+          <i class="bi bi-info-circle me-1"></i>Конфиг привязан к «{{ cfg.environment.name }}»
+        </div>
+        {% endif %}
       </div>
       <div class="col-md-4 d-flex align-items-end gap-3">
         <div class="form-check mb-0">
@@ -71,7 +86,7 @@
 <div class="card">
   <div class="card-header fw-semibold"><i class="bi bi-server me-1"></i>Экземпляры сервиса</div>
   <div class="card-body p-0">
-    {% if svc.instances %}
+    {% if relevant_instances %}
     <table class="table table-hover align-middle mb-0">
       <thead class="table-active">
         <tr>
@@ -83,7 +98,7 @@
         </tr>
       </thead>
       <tbody>
-        {% for inst in svc.instances %}
+        {% for inst in relevant_instances %}
         {% set st = instance_statuses.get(inst.id, 'untracked') %}
         <tr id="inst-row-{{ inst.id }}">
           <td class="font-monospace fw-semibold small">{{ inst.win_service_name }}</td>
@@ -114,7 +129,11 @@
     {% else %}
     <div class="text-center py-4 text-muted">
       <i class="bi bi-server fs-3 d-block mb-2"></i>
+      {% if cfg.env_id %}
+      Нет экземпляров в окружении «{{ cfg.environment.name }}».
+      {% else %}
       Нет экземпляров для этого сервиса.
+      {% endif %}
     </div>
     {% endif %}
   </div>
@@ -148,7 +167,7 @@ const SERVICE_ID   = {{ svc.id }};
 const CFG_ID       = {{ cfg.id }};
 const PUSH_URL     = '{{ url_for("service_config_push", service_id=svc.id, cfg_id=cfg.id) }}';
 const STREAM_URL   = '/manage/tasks/{task_id}/stream';
-const TOTAL_INSTS  = {{ svc.instances | length }};
+const TOTAL_INSTS  = {{ relevant_instances | length }};
 
 let doneCount = 0;
 

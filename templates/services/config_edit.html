@@ -24,7 +24,7 @@
   <div class="card-body">
     <form method="post">
       <div class="row g-3 mb-3">
-        <div class="col-md-5">
+        <div class="col-md-4">
           <label class="form-label fw-semibold">
             Имя файла <span class="text-danger">*</span>
           </label>
@@ -32,7 +32,22 @@
                  value="{{ cfg.filename if cfg else '' }}"
                  placeholder="connectionmanager.json" required autofocus>
         </div>
-        <div class="col-md-7">
+        <div class="col-md-3">
+          <label class="form-label fw-semibold">
+            Окружение
+            <span class="text-muted fw-normal small">(пусто = все)</span>
+          </label>
+          <select name="env_id" class="form-select">
+            <option value="">— все окружения (базовый) —</option>
+            {% for env in environments %}
+            <option value="{{ env.id }}"
+              {% if cfg and cfg.env_id == env.id %}selected{% endif %}>
+              {{ env.name }}{% if env.description %} — {{ env.description }}{% endif %}
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-5">
           <label class="form-label fw-semibold">Описание</label>
           <input type="text" name="description" class="form-control"
                  value="{{ cfg.description if cfg else '' }}"
