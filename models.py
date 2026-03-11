@@ -172,7 +172,9 @@ class AuditLog(db.Model):
     ACTION_TEST_CONN       = 'test_connection'
     ACTION_REFRESH_STATUS  = 'refresh_status'
     ACTION_REFRESH_CONFIGS = 'refresh_configs'
-    ACTION_CONTROL         = 'control'
+    ACTION_START           = 'start'
+    ACTION_STOP            = 'stop'
+    ACTION_RESTART         = 'restart'
     ACTION_SNAPSHOT        = 'snapshot'
 
     # Типы сущностей

@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -578,6 +579,13 @@ def create_app():
     # In-memory task registry: task_id -> {'q': Queue, 'done': bool}
     _tasks: dict = {}
 
+    # Map action string → AuditLog action constant + human label
+    _ACTION_META = {
+        'start':   (AuditLog.ACTION_START,   'Запуск'),
+        'stop':    (AuditLog.ACTION_STOP,    'Остановка'),
+        'restart': (AuditLog.ACTION_RESTART, 'Перезапуск'),
+    }
+
     def _take_snapshot(inst, trigger: str, _ip: str = 'system') -> ConfigSnapshot:
         """Create and persist a config snapshot before a control operation."""
         configs_data = [
@@ -590,9 +598,10 @@ def create_app():
             configs_json=json.dumps(configs_data, ensure_ascii=False),
         )
         db.session.add(snap)
+        label = _ACTION_META.get(trigger, (None, trigger))[1]
         _audit(AuditLog.ACTION_SNAPSHOT, AuditLog.ENTITY_SNAPSHOT,
                inst.id, inst.win_service_name,
-               details=f'trigger={trigger} server={inst.server.hostname} files={len(configs_data)}',
+               details=f'перед операцией: {label} | server={inst.server.hostname} | файлов: {len(configs_data)}',
                _ip=_ip)
         return snap
 
@@ -662,6 +671,8 @@ def create_app():
                      or request.remote_addr or 'unknown')
         inst_id = inst.id
 
+        action_const, action_label = _ACTION_META[action]
+
         def worker():
             try:
                 with app.app_context():
@@ -676,7 +687,7 @@ def create_app():
                     snap = _take_snapshot(inst_w, action, _ip=client_ip)
 
                     q.put({'type': 'progress', 'instance_id': inst_id,
-                           'message': f'Выполняю {action}…', 'snap_id': snap.id})
+                           'message': f'{action_label}…', 'snap_id': snap.id})
                     ok, msg = winrm_utils.control_service(inst_w.server, inst_w.win_service_name, action)
 
                     q.put({'type': 'progress', 'instance_id': inst_id,
@@ -686,9 +697,12 @@ def create_app():
                     inst_w.last_status_check = datetime.utcnow()
                     db.session.commit()
 
-                    _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
+                    details = f'server={inst_w.server.hostname} | статус: {new_status}'
+                    if not ok:
+                        details += f' | ошибка: {msg}'
+                    _audit(action_const, AuditLog.ENTITY_INSTANCE,
                            inst_w.id, inst_w.win_service_name,
-                           details=f'action={action} server={inst_w.server.hostname} result={msg} status={new_status}',
+                           details=details,
                            result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
                            _ip=client_ip)
 
@@ -727,54 +741,71 @@ def create_app():
         client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
                      or request.remote_addr or 'unknown')
 
+        action_const, action_label = _ACTION_META[action]
+
+        def process_one(iid: int) -> dict:
+            """Runs in its own thread with its own app context."""
+            with app.app_context():
+                inst_w = db.session.get(ServiceInstance, iid)
+                if inst_w is None:
+                    res = {'instance_id': iid, 'ok': False,
+                           'message': 'Экземпляр не найден', 'status': 'unknown', 'snap_id': None}
+                    q.put({'type': 'instance_done', **res})
+                    return res
+
+                svc_name = inst_w.win_service_name
+                q.put({'type': 'progress', 'instance_id': iid,
+                       'message': f'[{svc_name}] Снимаю снэпшот…'})
+                snap = _take_snapshot(inst_w, action, _ip=client_ip)
+
+                q.put({'type': 'progress', 'instance_id': iid,
+                       'message': f'[{svc_name}] {action_label}…', 'snap_id': snap.id})
+                ok, msg = winrm_utils.control_service(inst_w.server, svc_name, action)
+
+                q.put({'type': 'progress', 'instance_id': iid,
+                       'message': f'[{svc_name}] Проверяю статус…'})
+                new_status = winrm_utils.get_service_status(inst_w.server, svc_name)
+                inst_w.status = new_status
+                inst_w.last_status_check = datetime.utcnow()
+                db.session.commit()
+
+                details = f'server={inst_w.server.hostname} | bulk | статус: {new_status}'
+                if not ok:
+                    details += f' | ошибка: {msg}'
+                _audit(action_const, AuditLog.ENTITY_INSTANCE,
+                       inst_w.id, svc_name, details=details,
+                       result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
+                       _ip=client_ip)
+
+                res = {'instance_id': iid, 'ok': ok, 'message': msg,
+                       'status': new_status, 'snap_id': snap.id}
+                q.put({'type': 'instance_done', **res})
+                return res
+
         def worker():
-            results = []
+            results: list[dict] = []
             try:
-                with app.app_context():
-                    for inst_id in inst_ids:
-                        inst_w = db.session.get(ServiceInstance, inst_id)
-                        if inst_w is None:
-                            results.append({'instance_id': inst_id, 'ok': False,
-                                            'message': 'Not found', 'status': 'unknown'})
-                            continue
+                max_w = max(1, min(len(inst_ids), 8))
+                with ThreadPoolExecutor(max_workers=max_w) as pool:
+                    futures = {pool.submit(process_one, iid): iid for iid in inst_ids}
+                    for future in as_completed(futures):
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            iid = futures[future]
+                            err = {'instance_id': iid, 'ok': False,
+                                   'message': str(exc), 'status': 'unknown', 'snap_id': None}
+                            results.append(err)
+                            q.put({'type': 'instance_done', **err})
 
-                        q.put({'type': 'progress', 'instance_id': inst_id,
-                               'message': f'[{inst_w.win_service_name}] Снимаю снэпшот…'})
-                        snap = _take_snapshot(inst_w, action, _ip=client_ip)
-
-                        q.put({'type': 'progress', 'instance_id': inst_id,
-                               'message': f'[{inst_w.win_service_name}] Выполняю {action}…',
-                               'snap_id': snap.id})
-                        ok, msg = winrm_utils.control_service(inst_w.server, inst_w.win_service_name, action)
-
-                        q.put({'type': 'progress', 'instance_id': inst_id,
-                               'message': f'[{inst_w.win_service_name}] Проверяю статус…'})
-                        new_status = winrm_utils.get_service_status(inst_w.server, inst_w.win_service_name)
-                        inst_w.status = new_status
-                        inst_w.last_status_check = datetime.utcnow()
-                        db.session.commit()
-
-                        _audit(AuditLog.ACTION_CONTROL, AuditLog.ENTITY_INSTANCE,
-                               inst_w.id, inst_w.win_service_name,
-                               details=f'action={action} bulk=service#{service_id} server={inst_w.server.hostname} result={msg} status={new_status}',
-                               result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
-                               _ip=client_ip)
-
-                        res = {'instance_id': inst_id, 'ok': ok, 'message': msg,
-                               'status': new_status, 'snap_id': snap.id}
-                        results.append(res)
-                        q.put({'type': 'instance_done', **res})
-
+                q.put({'type': 'done_all', 'service_id': service_id,
+                       'ok': all(r['ok'] for r in results), 'results': results})
             except Exception as exc:
-                q.put({'type': 'done_all', 'service_id': service_id, 'ok': False,
-                       'results': results, 'error': str(exc)})
-                return
+                q.put({'type': 'done_all', 'service_id': service_id,
+                       'ok': False, 'results': results, 'error': str(exc)})
             finally:
                 if task_id in _tasks:
                     _tasks[task_id]['done'] = True
-
-            q.put({'type': 'done_all', 'service_id': service_id,
-                   'ok': all(r['ok'] for r in results), 'results': results})
 
         threading.Thread(target=worker, daemon=True).start()
         return jsonify({'task_id': task_id})

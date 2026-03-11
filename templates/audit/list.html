@@ -29,6 +29,10 @@
             ('test_connection', 'Проверка WinRM'),
             ('refresh_status',  'Обновление статуса'),
             ('refresh_configs', 'Перечитать конфиги'),
+            ('start',           'Запуск сервиса'),
+            ('stop',            'Остановка сервиса'),
+            ('restart',         'Перезапуск сервиса'),
+            ('snapshot',        'Снэпшот конфигурации'),
           ] %}
           <option value="{{ a[0] }}" {{ 'selected' if action == a[0] }}>{{ a[1] }}</option>
           {% endfor %}
@@ -45,6 +49,7 @@
             ('service',     'Сервис'),
             ('instance',    'Экземпляр'),
             ('config',      'Конфиг'),
+            ('snapshot',    'Снэпшот'),
           ] %}
           <option value="{{ e[0] }}" {{ 'selected' if entity == e[0] }}>{{ e[1] }}</option>
           {% endfor %}
@@ -96,12 +101,16 @@
 
         <td>
           {% set action_labels = {
-            'create':          ('plus-circle',       'text-success',  'Создание'),
-            'update':          ('pencil',            'text-primary',  'Изменение'),
-            'delete':          ('trash3',            'text-danger',   'Удаление'),
-            'test_connection': ('wifi',              'text-info',     'Проверка WinRM'),
-            'refresh_status':  ('arrow-clockwise',   'text-secondary','Статус'),
-            'refresh_configs': ('cloud-download',    'text-secondary','Конфиги'),
+            'create':          ('plus-circle',       'text-success',         'Создание'),
+            'update':          ('pencil',            'text-primary',         'Изменение'),
+            'delete':          ('trash3',            'text-danger',          'Удаление'),
+            'test_connection': ('wifi',              'text-info',            'Проверка WinRM'),
+            'refresh_status':  ('arrow-clockwise',   'text-secondary',       'Обновление статуса'),
+            'refresh_configs': ('cloud-download',    'text-secondary',       'Перечитать конфиги'),
+            'start':           ('play-fill',         'text-success',         'Запуск'),
+            'stop':            ('stop-fill',         'text-danger',          'Остановка'),
+            'restart':         ('arrow-repeat',      'text-warning',         'Перезапуск'),
+            'snapshot':        ('camera',            'text-info',            'Снэпшот'),
           } %}
           {% set al = action_labels.get(entry.action, ('dot', '', entry.action)) %}
           <span class="{{ al[1] }}">
@@ -117,6 +126,7 @@
             'service':     'Сервис',
             'instance':    'Экземпляр',
             'config':      'Конфиг',
+            'snapshot':    'Снэпшот',
           } %}
           <span class="badge bg-secondary">
             {{ entity_labels.get(entry.entity_type, entry.entity_type) }}
