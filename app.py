@@ -492,64 +492,114 @@ def create_app():
         servers = servers_q.order_by(Server.hostname).all()
 
         if request.method == 'POST':
-            server_ids  = request.form.getlist('server_id[]')
-            win_names   = request.form.getlist('win_service_name[]')
-            service_ids = request.form.getlist('service_id[]')
+            if request.is_json:
+                items = request.json.get('items', [])
+            else:
+                server_ids  = request.form.getlist('server_id[]')
+                win_names   = request.form.getlist('win_service_name[]')
+                service_ids = request.form.getlist('service_id[]')
+                items = [
+                    {'server_id': srv, 'win_service_name': win, 'service_id': svc}
+                    for srv, win, svc in zip(server_ids, win_names, service_ids)
+                ]
 
-            created, errors = 0, []
-            for srv_id, win_name, service_id in zip(server_ids, win_names, service_ids):
-                service_id = int(service_id)
-                win_name = win_name.strip()
-                if not win_name or not srv_id:
-                    continue
-                server = db.session.get(Server, int(srv_id))
-                if not server:
-                    continue
+            if not items:
+                return jsonify({'ok': False, 'error': 'Список пуст'}), 400
 
-                info = winrm_utils.get_service_info(server, win_name)
-                if info.get('error'):
-                    errors.append(f'{server.hostname}/{win_name}: {info["error"]}')
+            task_id = str(uuid.uuid4())
+            q: queue.Queue = queue.Queue()
+            _tasks[task_id] = {'q': q, 'done': False}
 
-                exe_path   = info.get('exe_path') or ''
-                config_dir = winrm_utils.infer_config_dir(exe_path) if exe_path else ''
+            client_ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                         or request.remote_addr or 'unknown')
 
-                inst = ServiceInstance(
-                    server_id=server.id,
-                    service_id=service_id,
-                    win_service_name=win_name,
-                    exe_path=exe_path,
-                    config_dir=config_dir,
-                    status=info.get('status', 'unknown'),
-                    last_status_check=datetime.utcnow(),
-                )
-                db.session.add(inst)
-                db.session.flush()
+            def worker():
+                created = 0
+                try:
+                    with app.app_context():
+                        for idx, item in enumerate(items):
+                            srv_id   = item.get('server_id')
+                            win_name = str(item.get('win_service_name', '')).strip()
+                            svc_id   = item.get('service_id')
+                            if not win_name or not srv_id:
+                                q.put({'type': 'item_done', 'index': idx,
+                                       'ok': False, 'win_name': win_name,
+                                       'hostname': '', 'message': 'Неверные параметры'})
+                                continue
 
-                cfg_count = 0
-                if config_dir:
-                    for cf in winrm_utils.fetch_all_configs(server, config_dir):
-                        db.session.add(InstanceConfig(
-                            instance_id=inst.id,
-                            filename=cf['filename'],
-                            filepath=cf['filepath'],
-                            content=cf['content'],
-                            encoding=cf['encoding'],
-                            fetched_at=cf['fetched_at'],
-                        ))
-                        cfg_count += 1
+                            server = db.session.get(Server, int(srv_id))
+                            if not server:
+                                q.put({'type': 'item_done', 'index': idx,
+                                       'ok': False, 'win_name': win_name,
+                                       'hostname': str(srv_id), 'message': 'Сервер не найден'})
+                                continue
 
-                _audit(AuditLog.ACTION_CREATE, AuditLog.ENTITY_INSTANCE,
-                       inst.id, win_name,
-                       details=f'server={server.hostname} config_dir={config_dir!r} configs={cfg_count}',
-                       result=AuditLog.RESULT_WARNING if info.get('error') else AuditLog.RESULT_OK)
-                created += 1
+                            q.put({'type': 'item_progress', 'index': idx,
+                                   'win_name': win_name, 'hostname': server.hostname,
+                                   'message': 'Получаю информацию о сервисе…'})
+                            try:
+                                info = winrm_utils.get_service_info(server, win_name)
+                                exe_path   = info.get('exe_path') or ''
+                                config_dir = winrm_utils.infer_config_dir(exe_path) if exe_path else ''
 
-            db.session.commit()
-            if created:
-                flash(f'Добавлено экземпляров: {created}.', 'success')
-            for e in errors:
-                flash(e, 'warning')
-            return redirect(url_for('instance_list'))
+                                inst = ServiceInstance(
+                                    server_id=server.id,
+                                    service_id=int(svc_id),
+                                    win_service_name=win_name,
+                                    exe_path=exe_path,
+                                    config_dir=config_dir,
+                                    status=info.get('status', 'unknown'),
+                                    last_status_check=datetime.utcnow(),
+                                )
+                                db.session.add(inst)
+                                db.session.flush()
+
+                                cfg_count = 0
+                                if config_dir:
+                                    q.put({'type': 'item_progress', 'index': idx,
+                                           'win_name': win_name, 'hostname': server.hostname,
+                                           'message': 'Загружаю конфиги…'})
+                                    for cf in winrm_utils.fetch_all_configs(server, config_dir):
+                                        db.session.add(InstanceConfig(
+                                            instance_id=inst.id,
+                                            filename=cf['filename'],
+                                            filepath=cf['filepath'],
+                                            content=cf['content'],
+                                            encoding=cf['encoding'],
+                                            fetched_at=cf['fetched_at'],
+                                        ))
+                                        cfg_count += 1
+
+                                db.session.commit()
+                                _audit(AuditLog.ACTION_CREATE, AuditLog.ENTITY_INSTANCE,
+                                       inst.id, win_name,
+                                       details=(f'server={server.hostname}'
+                                                f' config_dir={config_dir!r}'
+                                                f' configs={cfg_count}'),
+                                       result=AuditLog.RESULT_WARNING if info.get('error') else AuditLog.RESULT_OK,
+                                       _ip=client_ip)
+                                created += 1
+                                msg = info.get('error') or f'Конфигов: {cfg_count}'
+                                q.put({'type': 'item_done', 'index': idx, 'ok': True,
+                                       'win_name': win_name, 'hostname': server.hostname,
+                                       'message': msg})
+                            except Exception as exc:
+                                db.session.rollback()
+                                q.put({'type': 'item_done', 'index': idx, 'ok': False,
+                                       'win_name': win_name, 'hostname': server.hostname,
+                                       'message': str(exc)})
+
+                        q.put({'type': 'done_all', 'ok': True, 'created': created,
+                               'total': len(items)})
+                except Exception as exc:
+                    q.put({'type': 'done_all', 'ok': False, 'created': created,
+                           'total': len(items), 'error': str(exc)})
+                finally:
+                    if task_id in _tasks:
+                        _tasks[task_id]['done'] = True
+
+            threading.Thread(target=worker, daemon=True).start()
+            return jsonify({'task_id': task_id})
 
         return render_template('instances/create.html', services=services, servers=servers)
 
