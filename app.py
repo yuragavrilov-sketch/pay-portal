@@ -1196,6 +1196,7 @@ def create_app():
     @app.route('/manage')
     def manage_index():
         current_env_id = session.get('current_env_id')
+        current_env = Environment.query.get(current_env_id) if current_env_id else None
         query = ServiceInstance.query.join(Server)
         if current_env_id:
             query = query.join(Server.environments).filter(Environment.id == current_env_id)
@@ -1209,7 +1210,8 @@ def create_app():
                 services_map[sid] = {'service': inst.service, 'instances': []}
             services_map[sid]['instances'].append(inst)
 
-        return render_template('manage/index.html', service_groups=list(services_map.values()))
+        return render_template('manage/index.html', service_groups=list(services_map.values()),
+                               current_env=current_env)
 
     # ------------------------------------------------------------------
     # SSE task stream

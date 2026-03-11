@@ -590,7 +590,7 @@ function renderCfgPanel(data) {
         ${stIcon[inst.status] || stIcon.untracked}
         <span class="ms-auto d-flex gap-1">
           <button class="btn btn-xs btn-outline-info" style="font-size:.72rem;padding:1px 7px;"
-                  onclick="showDiff(${inst.instance_id}, ${JSON.stringify(cfg.filename)})"
+                  onclick="showDiff(${inst.instance_id}, '${escHtml(cfg.filename)}')"
                   title="Сравнить с реальным файлом на сервере">
             <i class="bi bi-file-diff"></i> Diff
           </button>
@@ -695,19 +695,119 @@ function renderCfgBadgesAll(data) {
   }
 }
 
-// ── Reload all config badges (triggered by button) ────────────────────
-async function reloadAllCfgBadges() {
+// ── Render live scan badges (WinRM file comparison) ───────────────────
+function renderScanBadges(instanceId, scanData) {
+  const el = document.getElementById('cfg-badges-' + instanceId);
+  if (!el) return;
+
+  if (!scanData.ok) {
+    el.innerHTML = `<span class="badge bg-secondary" style="font-size:.65rem;"
+      title="${escHtml(scanData.message || 'Ошибка подключения')}">
+      <i class="bi bi-x-circle"></i> недоступен</span>`;
+    return;
+  }
+
+  const diffs = scanData.diffs || [];
+  if (!diffs.length) {
+    el.innerHTML = '<span class="text-muted small">—</span>';
+    return;
+  }
+
+  const changed = diffs.filter(d => d.status !== 'ok');
+  const summaryBadge = changed.length === 0
+    ? `<span class="badge bg-success me-1" style="font-size:.65rem;"
+         title="Все ${diffs.length} файл(ов) совпадают с сервером">
+         <i class="bi bi-check-lg"></i> ${diffs.length}</span>`
+    : `<span class="badge bg-warning text-dark me-1" style="font-size:.65rem;"
+         title="${changed.length} файл(ов) отличаются от сервера">
+         <i class="bi bi-exclamation-triangle"></i> ${changed.length}/${diffs.length}</span>`;
+
+  const chips = diffs.map(d => {
+    const cls =
+      d.status === 'ok'                ? 'bg-success text-white'  :
+      d.status === 'changed'           ? 'bg-warning text-dark'   :
+      d.status === 'new_on_server'     ? 'bg-info text-white'     :
+      d.status === 'missing_on_server' ? 'bg-danger text-white'   :
+                                         'bg-secondary text-white';
+    const lbl = {ok:'ok', changed:'изм.', new_on_server:'новый', missing_on_server:'нет'}[d.status] || d.status;
+    return `<span class="cfg-ver-badge ${cls}"
+                  title="${escHtml(d.file)} — ${lbl}">
+              ${escHtml(d.file.split('.')[0])}
+            </span>`;
+  }).join('');
+
+  el.innerHTML = summaryBadge + chips;
+}
+
+// ── Run WinRM config scan and update badges ───────────────────────────
+let _scanEs = null;
+
+async function _autoScanConfigs() {
+  const envId = {{ current_env.id if current_env else 'null' }};
   const spin = document.getElementById('cfg-reload-spin');
   const btn  = document.getElementById('btnReloadCfgs');
   spin.classList.add('spin');
   btn.disabled = true;
-  try { await _fetchAllCfgBadges(); } finally {
+
+  // Show scanning placeholder on all instance badge cells
+  document.querySelectorAll('[id^="cfg-badges-"]').forEach(el => {
+    el.innerHTML = '<span class="text-muted" style="font-size:.7rem;">'
+      + '<span class="spinner-border spinner-border-sm" style="width:.6rem;height:.6rem;border-width:1px;"></span>'
+      + '</span>';
+  });
+
+  try {
+    const r = await fetch('/instances/scan-configs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(envId ? {env_id: envId} : {}),
+    });
+    const d = await r.json();
+    if (!d.task_id) {
+      await _fetchAllCfgBadges();
+      spin.classList.remove('spin');
+      btn.disabled = false;
+      return;
+    }
+
+    if (_scanEs) { _scanEs.close(); _scanEs = null; }
+    _scanEs = new EventSource(`/manage/tasks/${d.task_id}/stream`);
+    _scanEs.onmessage = (ev) => {
+      const data = JSON.parse(ev.data);
+      if (data.type === 'heartbeat') return;
+      if (data.type === 'scan_done') {
+        renderScanBadges(data.instance_id, data);
+      } else if (data.type === 'done_all') {
+        _scanEs.close(); _scanEs = null;
+        spin.classList.remove('spin');
+        btn.disabled = false;
+        // Clear any remaining spinners (instances with no configs)
+        document.querySelectorAll('[id^="cfg-badges-"]').forEach(el => {
+          if (el.querySelector('.spinner-border')) {
+            el.innerHTML = '<span class="text-muted small">—</span>';
+          }
+        });
+      }
+    };
+    _scanEs.onerror = () => {
+      if (_scanEs) { _scanEs.close(); _scanEs = null; }
+      spin.classList.remove('spin');
+      btn.disabled = false;
+      _fetchAllCfgBadges();
+    };
+  } catch {
     spin.classList.remove('spin');
     btn.disabled = false;
+    await _fetchAllCfgBadges();
   }
 }
 
-// ── Auto-load config badges for all services on page start ────────────
+// ── Reload button: re-run scan ────────────────────────────────────────
+function reloadAllCfgBadges() {
+  _autoScanConfigs();
+}
+
+// ── Fallback: load config badges from DB (no WinRM) ───────────────────
 async function _fetchAllCfgBadges() {
   const svcIds = [
     {% for group in service_groups %}
@@ -728,14 +828,14 @@ async function _fetchAllCfgBadges() {
     } catch {}
   }));
   document.querySelectorAll('[id^="cfg-badges-"]').forEach(el => {
-    if (el.innerHTML.includes('…')) {
+    if (el.querySelector('.spinner-border') || el.innerHTML.includes('…')) {
       el.innerHTML = '<span class="text-muted small">—</span>';
     }
   });
 }
 
-// Auto-load on page start
-_fetchAllCfgBadges();
+// Auto-scan on page start
+_autoScanConfigs();
 
 // ── Progress helpers ──────────────────────────────────────────────────
 function clearProgress() {
