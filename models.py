@@ -319,6 +319,7 @@ class AuditLog(db.Model):
     details     = db.Column(db.Text)          # произвольный текст / diff
     result      = db.Column(db.String(16), default=RESULT_OK)
     ip_address  = db.Column(db.String(45))    # IPv4/IPv6
+    username    = db.Column(db.String(128))   # Keycloak username
     created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
     def __repr__(self):

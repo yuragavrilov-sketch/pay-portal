@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.env
+*.db
+*.sqlite
+logs/
+instance/
+frontend/node_modules
+frontend/dist
+static/react
+.git
+.gitignore
+*.md
