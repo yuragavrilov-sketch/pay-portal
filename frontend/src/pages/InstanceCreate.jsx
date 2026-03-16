@@ -1,48 +1,70 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import api from '../api';
 import useSSE from '../hooks/useSSE';
 
-const STEPS = [
-  { key: 'servers',  label: 'Серверы',       icon: 'bi-server' },
-  { key: 'discover', label: 'Обнаружение',   icon: 'bi-search' },
-  { key: 'assign',   label: 'Назначение',    icon: 'bi-diagram-3' },
-  { key: 'create',   label: 'Создание',      icon: 'bi-check-lg' },
+const STEPS_FULL = [
+  { key: 'servers',  label: 'Серверы',     icon: 'bi-server' },
+  { key: 'discover', label: 'Обнаружение', icon: 'bi-search' },
+  { key: 'assign',   label: 'Назначение',  icon: 'bi-diagram-3' },
+  { key: 'create',   label: 'Создание',    icon: 'bi-check-lg' },
+];
+
+const STEPS_SHORT = [
+  { key: 'servers',  label: 'Серверы',     icon: 'bi-server' },
+  { key: 'discover', label: 'Обнаружение', icon: 'bi-search' },
+  { key: 'create',   label: 'Создание',    icon: 'bi-check-lg' },
 ];
 
 export default function InstanceCreate() {
   const navigate = useNavigate();
+  const [sp] = useSearchParams();
+  const presetServiceId = sp.get('serviceId') || '';
+  const STEPS = presetServiceId ? STEPS_SHORT : STEPS_FULL;
+
   const [step, setStep] = useState(0);
 
-  // Step 1 — servers
+  // Step: servers
   const [servers, setServers] = useState([]);
   const [selectedServerIds, setSelectedServerIds] = useState(new Set());
 
-  // Step 2 — discover
+  // Step: discover
   const [discoverUrl, setDiscoverUrl] = useState(null);
   const [discovering, setDiscovering] = useState(false);
-  const [serverResults, setServerResults] = useState({});  // { serverId: { ok, hostname, services, error } }
-  const [selectedWinSvcs, setSelectedWinSvcs] = useState(new Set());  // "serverId:winName"
+  const [serverResults, setServerResults] = useState({});
+  const [selectedWinSvcs, setSelectedWinSvcs] = useState(new Set());
   const [hideRegistered, setHideRegistered] = useState(true);
   const [searchFilter, setSearchFilter] = useState('');
 
-  // Step 3 — assign service
+  // Step: assign (only in full mode)
   const [services, setServices] = useState([]);
-  const [assignments, setAssignments] = useState({});  // "serverId:winName" -> serviceId
+  const [assignments, setAssignments] = useState({});
   const [bulkServiceId, setBulkServiceId] = useState('');
 
-  // Step 4 — create
+  // Preset service info
+  const [presetService, setPresetService] = useState(null);
+
+  // Step: create
   const [createUrl, setCreateUrl] = useState(null);
   const [createResults, setCreateResults] = useState([]);
   const [createDone, setCreateDone] = useState(false);
 
-  // Load servers + catalog services on mount
   useEffect(() => {
     api.serverList().then(d => setServers(d.servers || []));
-    api.svcList().then(d => setServices(d.services || []));
+    if (!presetServiceId) {
+      api.svcList().then(d => setServices(d.services || []));
+    } else {
+      api.svcGet(presetServiceId).then(setPresetService).catch(() => {});
+    }
   }, []);
 
-  // --- Step 1: Server selection ---
+  // --- Helpers to map step index to logical step key ---
+  const stepKey = STEPS[step]?.key;
+
+  const assignStepIdx = presetServiceId ? -1 : 2;
+  const createStepIdx = presetServiceId ? 2 : 3;
+
+  // --- Step: Server selection ---
   const toggleServer = (id) => {
     setSelectedServerIds(prev => {
       const next = new Set(prev);
@@ -58,7 +80,7 @@ export default function InstanceCreate() {
     }
   };
 
-  // --- Step 2: Discover ---
+  // --- Step: Discover ---
   const startDiscover = async () => {
     setDiscovering(true);
     setServerResults({});
@@ -70,7 +92,7 @@ export default function InstanceCreate() {
   };
 
   useEffect(() => {
-    if (step === 1 && !discovering && Object.keys(serverResults).length === 0) {
+    if (stepKey === 'discover' && !discovering && Object.keys(serverResults).length === 0) {
       startDiscover();
     }
   }, [step]);
@@ -86,7 +108,6 @@ export default function InstanceCreate() {
   }, []);
   useSSE(discoverUrl, onDiscoverSSE, () => { setDiscovering(false); setDiscoverUrl(null); });
 
-  // Flattened discovered services list
   const discoveredList = useMemo(() => {
     const list = [];
     for (const [srvId, res] of Object.entries(serverResults)) {
@@ -94,13 +115,9 @@ export default function InstanceCreate() {
       for (const svc of (res.services || [])) {
         const key = `${srvId}:${svc.name}`;
         list.push({
-          key,
-          serverId: Number(srvId),
-          hostname: res.hostname,
-          name: svc.name,
-          displayName: svc.display_name,
-          status: svc.status,
-          alreadyRegistered: svc.already_registered,
+          key, serverId: Number(srvId), hostname: res.hostname,
+          name: svc.name, displayName: svc.display_name,
+          status: svc.status, alreadyRegistered: svc.already_registered,
         });
       }
     }
@@ -131,7 +148,7 @@ export default function InstanceCreate() {
 
   const toggleAllVisible = () => {
     const visibleKeys = filteredList.filter(i => !i.alreadyRegistered).map(i => i.key);
-    const allSelected = visibleKeys.every(k => selectedWinSvcs.has(k));
+    const allSelected = visibleKeys.length > 0 && visibleKeys.every(k => selectedWinSvcs.has(k));
     setSelectedWinSvcs(prev => {
       const next = new Set(prev);
       visibleKeys.forEach(k => allSelected ? next.delete(k) : next.add(k));
@@ -139,7 +156,7 @@ export default function InstanceCreate() {
     });
   };
 
-  // --- Step 3: Assign ---
+  // --- Step: Assign ---
   const selectedItems = useMemo(() =>
     discoveredList.filter(i => selectedWinSvcs.has(i.key)),
     [discoveredList, selectedWinSvcs]
@@ -152,14 +169,16 @@ export default function InstanceCreate() {
     setAssignments(next);
   };
 
-  const allAssigned = selectedItems.every(i => assignments[i.key]);
+  const allAssigned = presetServiceId
+    ? true
+    : selectedItems.every(i => assignments[i.key]);
 
-  // --- Step 4: Create ---
+  // --- Step: Create ---
   const startCreate = async () => {
     const items = selectedItems.map(i => ({
       server_id: i.serverId,
       win_service_name: i.name,
-      service_id: assignments[i.key],
+      service_id: presetServiceId || assignments[i.key],
     }));
     setCreateResults([]);
     setCreateDone(false);
@@ -170,7 +189,7 @@ export default function InstanceCreate() {
   };
 
   useEffect(() => {
-    if (step === 3 && !createDone && createResults.length === 0 && !createUrl) {
+    if (stepKey === 'create' && !createDone && createResults.length === 0 && !createUrl) {
       startCreate();
     }
   }, [step]);
@@ -188,18 +207,14 @@ export default function InstanceCreate() {
 
   // --- Navigation ---
   const canNext = () => {
-    if (step === 0) return selectedServerIds.size > 0;
-    if (step === 1) return selectedWinSvcs.size > 0 && !discovering;
-    if (step === 2) return allAssigned;
+    if (stepKey === 'servers') return selectedServerIds.size > 0;
+    if (stepKey === 'discover') return selectedWinSvcs.size > 0 && !discovering;
+    if (stepKey === 'assign') return allAssigned;
     return false;
   };
 
-  const goNext = () => {
-    if (step < STEPS.length - 1) setStep(step + 1);
-  };
-  const goBack = () => {
-    if (step > 0) setStep(step - 1);
-  };
+  const goNext = () => { if (step < STEPS.length - 1) setStep(step + 1); };
+  const goBack = () => { if (step > 0) setStep(step - 1); };
 
   // --- Render ---
   const renderStepIndicator = () => (
@@ -218,9 +233,9 @@ export default function InstanceCreate() {
     </div>
   );
 
-  const renderStep0 = () => (
+  const renderServers = () => (
     <div>
-      <p className="text-muted mb-3">Выберите серверы, на которых нужно найти Windows-сервисы. Обнаружение будет выполнено параллельно.</p>
+      <p className="text-muted mb-3">Выберите серверы для обнаружения Windows-сервисов (параллельно).</p>
       <div className="mb-2">
         <button className="btn btn-sm btn-outline-secondary" onClick={toggleAllServers}>
           <i className={`bi ${selectedServerIds.size === servers.length ? 'bi-check-square' : 'bi-square'} me-1`}></i>
@@ -250,14 +265,13 @@ export default function InstanceCreate() {
     </div>
   );
 
-  const renderStep1 = () => {
+  const renderDiscover = () => {
     const doneCount = Object.keys(serverResults).length;
     const totalCount = selectedServerIds.size;
     const errorServers = Object.values(serverResults).filter(r => !r.ok);
 
     return (
       <div>
-        {/* Progress */}
         {discovering && (
           <div className="mb-3">
             <div className="d-flex align-items-center gap-2 mb-2">
@@ -270,7 +284,6 @@ export default function InstanceCreate() {
           </div>
         )}
 
-        {/* Errors */}
         {errorServers.length > 0 && (
           <div className="alert alert-warning py-2 mb-3">
             <i className="bi bi-exclamation-triangle me-1"></i>
@@ -281,7 +294,6 @@ export default function InstanceCreate() {
           </div>
         )}
 
-        {/* Filters */}
         <div className="d-flex gap-2 mb-3 align-items-center flex-wrap">
           <div className="form-check">
             <input type="checkbox" className="form-check-input" id="hideReg"
@@ -299,7 +311,6 @@ export default function InstanceCreate() {
           </span>
         </div>
 
-        {/* Table */}
         <div className="table-responsive" style={{ maxHeight: 450, overflow: 'auto' }}>
           <table className="table table-sm table-hover align-middle mb-0">
             <thead className="table-light sticky-top">
@@ -346,11 +357,9 @@ export default function InstanceCreate() {
     );
   };
 
-  const renderStep2 = () => (
+  const renderAssign = () => (
     <div>
-      <p className="text-muted mb-3">Назначьте каталожный сервис для каждого выбранного Windows-сервиса.</p>
-
-      {/* Bulk assign */}
+      <p className="text-muted mb-3">Назначьте каталожный сервис для каждого Windows-сервиса.</p>
       <div className="card bg-light mb-3">
         <div className="card-body py-2 d-flex align-items-center gap-2">
           <span className="text-muted small">Назначить всем:</span>
@@ -364,8 +373,6 @@ export default function InstanceCreate() {
           </button>
         </div>
       </div>
-
-      {/* Per-item assignment */}
       <div className="table-responsive" style={{ maxHeight: 450, overflow: 'auto' }}>
         <table className="table table-sm align-middle mb-0">
           <thead className="table-light sticky-top">
@@ -390,33 +397,32 @@ export default function InstanceCreate() {
           </tbody>
         </table>
       </div>
-
       {!allAssigned && (
         <div className="alert alert-warning py-2 mt-3 small">
           <i className="bi bi-exclamation-triangle me-1"></i>
-          Назначьте сервис для всех {selectedItems.filter(i => !assignments[i.key]).length} оставшихся элементов
+          Назначьте сервис для всех {selectedItems.filter(i => !assignments[i.key]).length} оставшихся
         </div>
       )}
     </div>
   );
 
-  const renderStep3 = () => {
+  const renderCreate = () => {
     const okCount = createResults.filter(r => r.ok).length;
     const errCount = createResults.filter(r => !r.ok).length;
+    const backUrl = presetServiceId ? `/services` : '/instances';
 
     return (
       <div>
         {!createDone && (
-          <div className="d-flex align-items-center gap-2 mb-3">
-            <div className="spinner-border spinner-border-sm"></div>
-            <span>Создание экземпляров... {createResults.length}/{selectedItems.length}</span>
-          </div>
-        )}
-
-        {!createDone && (
-          <div className="progress mb-3" style={{ height: 6 }}>
-            <div className="progress-bar" style={{ width: `${selectedItems.length ? (createResults.length / selectedItems.length) * 100 : 0}%` }}></div>
-          </div>
+          <>
+            <div className="d-flex align-items-center gap-2 mb-3">
+              <div className="spinner-border spinner-border-sm"></div>
+              <span>Создание экземпляров... {createResults.length}/{selectedItems.length}</span>
+            </div>
+            <div className="progress mb-3" style={{ height: 6 }}>
+              <div className="progress-bar" style={{ width: `${selectedItems.length ? (createResults.length / selectedItems.length) * 100 : 0}%` }}></div>
+            </div>
+          </>
         )}
 
         {createDone && (
@@ -439,8 +445,8 @@ export default function InstanceCreate() {
 
         {createDone && (
           <div className="mt-3 d-flex gap-2">
-            <button className="btn btn-primary" onClick={() => navigate('/instances')}>
-              <i className="bi bi-arrow-left me-1"></i>К списку экземпляров
+            <button className="btn btn-primary" onClick={() => navigate(backUrl)}>
+              <i className="bi bi-arrow-left me-1"></i>Назад
             </button>
             <button className="btn btn-outline-secondary" onClick={() => navigate('/manage')}>
               <i className="bi bi-toggles me-1"></i>Управление
@@ -451,9 +457,16 @@ export default function InstanceCreate() {
     );
   };
 
+  const serviceName = presetService
+    ? (presetService.display_name || presetService.name)
+    : null;
+
   return (
     <div>
-      <h4 className="mb-3"><i className="bi bi-magic me-2"></i>Мастер добавления экземпляров</h4>
+      <h4 className="mb-3">
+        <i className="bi bi-magic me-2"></i>Мастер добавления экземпляров
+        {serviceName && <span className="badge bg-primary fs-6 ms-2">{serviceName}</span>}
+      </h4>
 
       {renderStepIndicator()}
 
@@ -463,18 +476,18 @@ export default function InstanceCreate() {
           <span className="fw-semibold">{STEPS[step].label}</span>
         </div>
         <div className="card-body">
-          {step === 0 && renderStep0()}
-          {step === 1 && renderStep1()}
-          {step === 2 && renderStep2()}
-          {step === 3 && renderStep3()}
+          {stepKey === 'servers' && renderServers()}
+          {stepKey === 'discover' && renderDiscover()}
+          {stepKey === 'assign' && renderAssign()}
+          {stepKey === 'create' && renderCreate()}
         </div>
-        {step < 3 && (
+        {stepKey !== 'create' && (
           <div className="card-footer d-flex justify-content-between">
             <button className="btn btn-outline-secondary" onClick={goBack} disabled={step === 0}>
               <i className="bi bi-arrow-left me-1"></i>Назад
             </button>
             <button className="btn btn-primary" onClick={goNext} disabled={!canNext()}>
-              {step === 2 ? 'Создать' : 'Далее'}
+              {step === STEPS.length - 2 ? 'Создать' : 'Далее'}
               <i className="bi bi-arrow-right ms-1"></i>
             </button>
           </div>

@@ -50,6 +50,9 @@ export default function ServiceList() {
                 </Link>
               </td>
               <td className="text-end">
+                <Link to={`/instances/create?serviceId=${s.id}`} className="btn btn-sm btn-outline-success me-1" title="Добавить экземпляры">
+                  <i className="bi bi-plus-lg"></i>
+                </Link>
                 <Link to={`/services/${s.id}/edit`} className="btn btn-sm btn-outline-secondary me-1">
                   <i className="bi bi-pencil"></i>
                 </Link>
