@@ -237,7 +237,7 @@ export default function InstanceCreate() {
             <div>
               <span className="font-monospace fw-semibold">{s.hostname}</span>
               {s.environments?.length > 0 && (
-                <span className="ms-2">{s.environments.map(e => <span key={e} className="badge bg-secondary me-1">{e}</span>)}</span>
+                <span className="ms-2">{s.environments.map(e => <span key={e.id} className="badge bg-secondary me-1">{e.name}</span>)}</span>
               )}
             </div>
             <span className={`ms-auto badge ${s.is_available ? 'bg-success' : 'bg-secondary'}`}>
