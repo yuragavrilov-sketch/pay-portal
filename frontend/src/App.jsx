@@ -7,13 +7,9 @@ import Login from './pages/Login';
 
 import Dashboard from './pages/Dashboard';
 import EnvironmentList from './pages/EnvironmentList';
-import EnvironmentForm from './pages/EnvironmentForm';
 import CredentialList from './pages/CredentialList';
-import CredentialForm from './pages/CredentialForm';
 import ServerList from './pages/ServerList';
-import ServerForm from './pages/ServerForm';
 import ServiceList from './pages/ServiceList';
-import ServiceForm from './pages/ServiceForm';
 import ServiceConfigs from './pages/ServiceConfigs';
 import ServiceConfigEdit from './pages/ServiceConfigEdit';
 import ServiceConfigVersions from './pages/ServiceConfigVersions';
@@ -47,17 +43,9 @@ function ProtectedRoutes() {
         <Route element={<Layout />}>
           <Route path="/" element={<Dashboard />} />
           <Route path="/environments" element={<EnvironmentList />} />
-          <Route path="/environments/create" element={<EnvironmentForm />} />
-          <Route path="/environments/:id/edit" element={<EnvironmentForm />} />
           <Route path="/credentials" element={<CredentialList />} />
-          <Route path="/credentials/create" element={<CredentialForm />} />
-          <Route path="/credentials/:id/edit" element={<CredentialForm />} />
           <Route path="/servers" element={<ServerList />} />
-          <Route path="/servers/create" element={<ServerForm />} />
-          <Route path="/servers/:id/edit" element={<ServerForm />} />
           <Route path="/services" element={<ServiceList />} />
-          <Route path="/services/create" element={<ServiceForm />} />
-          <Route path="/services/:id/edit" element={<ServiceForm />} />
           <Route path="/services/:serviceId/configs" element={<ServiceConfigs />} />
           <Route path="/services/:serviceId/configs/create" element={<ServiceConfigEdit />} />
           <Route path="/services/:serviceId/configs/:cfgId/edit" element={<ServiceConfigEdit />} />

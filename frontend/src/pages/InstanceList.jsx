@@ -65,8 +65,9 @@ export default function InstanceList() {
           </Link>
         </div>
       </div>
-      <table className="table table-hover">
-        <thead><tr><th>Сервис</th><th>Имя (Windows)</th><th>Сервер</th><th>Окружение</th><th>Статус</th><th>Скан</th><th></th></tr></thead>
+      <div className="card"><div className="table-responsive">
+      <table className="table table-hover align-middle mb-0">
+        <thead className="table-light"><tr><th>Сервис</th><th>Имя (Windows)</th><th>Сервер</th><th>Окружение</th><th>Статус</th><th>Скан</th><th style={{width:100}}></th></tr></thead>
         <tbody>
           {instances.map(inst => {
             const scan = scanResults[inst.id];
@@ -106,6 +107,7 @@ export default function InstanceList() {
           {!instances.length && <tr><td colSpan={7} className="text-center text-muted py-4">Нет экземпляров</td></tr>}
         </tbody>
       </table>
+      </div></div>
       <Confirm show={!!delId} title="Удалить экземпляр?" body="Это действие нельзя отменить."
                onConfirm={doDelete} onCancel={() => setDelId(null)} />
     </div>
