@@ -98,12 +98,7 @@ def create_app():
     react_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'react')
 
     app = Flask(__name__, static_folder=None)
-    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-change-me')
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
-        'DATABASE_URL',
-        'postgresql://postgres:postgres@localhost:5432/svcmgr',
-    )
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config.from_object('config.Config')
 
     db.init_app(app)
     setup_logging(app)

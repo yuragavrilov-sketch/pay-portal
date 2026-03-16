@@ -25,6 +25,9 @@ export default function Manage() {
   const [deployResults, setDeployResults] = useState([]);
   const [deployDone, setDeployDone] = useState(false);
 
+  // Selected version per config (replaces document.getElementById)
+  const [selectedVersions, setSelectedVersions] = useState({});
+
   // Snapshot modal
   const [snapshots, setSnapshots] = useState(null);
   const [snapDetail, setSnapDetail] = useState(null);
@@ -112,8 +115,14 @@ export default function Manage() {
   };
 
   // --- Config Mgmt ---
+  const getSelectedVer = (cfgId) => selectedVersions[cfgId];
+
   const openCfgMgmt = (svcId) => {
     const summary = cfgSummaries[svcId];
+    // Init selected versions to current for each config
+    const initial = {};
+    summary?.configs?.forEach(cfg => { initial[cfg.id] = cfg.current_version_id; });
+    setSelectedVersions(initial);
     setCfgMgmt({ svcId, summary });
     setDeployResults([]);
     setDeployDone(false);
@@ -144,6 +153,9 @@ export default function Manage() {
     } catch {}
   };
 
+  const cfgMgmtRef = React.useRef(cfgMgmt);
+  React.useEffect(() => { cfgMgmtRef.current = cfgMgmt; }, [cfgMgmt]);
+
   const onDeploySSE = useCallback((ev, es) => {
     if (ev.type === 'instance_done' || ev.type === 'done') {
       setDeployResults(prev => [...prev, ev]);
@@ -151,14 +163,15 @@ export default function Manage() {
     if (ev.type === 'done' || ev.type === 'done_all') {
       es.close(); setDeployUrl(null); setDeployDone(true);
       // Reload summaries
-      if (cfgMgmt) {
-        api.cfgSummary(cfgMgmt.svcId).then(d => {
-          setCfgSummaries(prev => ({ ...prev, [cfgMgmt.svcId]: d }));
+      const mgmt = cfgMgmtRef.current;
+      if (mgmt) {
+        api.cfgSummary(mgmt.svcId).then(d => {
+          setCfgSummaries(prev => ({ ...prev, [mgmt.svcId]: d }));
           setCfgMgmt(prev => prev ? { ...prev, summary: d } : null);
         }).catch(() => {});
       }
     }
-  }, [cfgMgmt]);
+  }, []);
   useSSE(deployUrl, onDeploySSE);
 
   // --- Snapshots ---
@@ -312,18 +325,19 @@ export default function Manage() {
                       <span className="fw-semibold font-monospace">{cfg.filename}</span>
                       {cfg.env_label && <span className="badge bg-primary">{cfg.env_label}</span>}
                       <span className="ms-auto d-flex gap-2 align-items-center">
-                        <select id={`ver-sel-${cfg.id}`} className="form-select form-select-sm" style={{ width: 'auto', minWidth: 260 }}
-                                defaultValue={cfg.current_version_id}>
+                        <select className="form-select form-select-sm" style={{ width: 'auto', minWidth: 260 }}
+                                value={getSelectedVer(cfg.id) ?? ''}
+                                onChange={e => setSelectedVersions(prev => ({ ...prev, [cfg.id]: parseInt(e.target.value, 10) }))}>
                           {cfg.versions.map(v => (
                             <option key={v.id} value={v.id}>v{v.version}{v.is_current ? ' *' : ''} — {v.comment || v.created_at}</option>
                           ))}
                         </select>
                         <button className="btn btn-sm btn-outline-primary"
-                                onClick={() => deployAll(cfg.id, parseInt(document.getElementById(`ver-sel-${cfg.id}`).value), false)}>
+                                onClick={() => deployAll(cfg.id, getSelectedVer(cfg.id), false)}>
                           Deploy all
                         </button>
                         <button className="btn btn-sm btn-warning"
-                                onClick={() => deployAll(cfg.id, parseInt(document.getElementById(`ver-sel-${cfg.id}`).value), true)}>
+                                onClick={() => deployAll(cfg.id, getSelectedVer(cfg.id), true)}>
                           Deploy+Restart all
                         </button>
                       </span>
@@ -341,11 +355,11 @@ export default function Manage() {
                               <i className="bi bi-file-diff"></i> Diff
                             </button>
                             <button className="btn btn-outline-primary" style={{ fontSize: '.72rem', padding: '1px 7px' }}
-                                    onClick={() => deployOne(inst.instance_id, cfg.id, parseInt(document.getElementById(`ver-sel-${cfg.id}`).value), false)}>
+                                    onClick={() => deployOne(inst.instance_id, cfg.id, getSelectedVer(cfg.id), false)}>
                               Deploy
                             </button>
                             <button className="btn btn-warning" style={{ fontSize: '.72rem', padding: '1px 7px' }}
-                                    onClick={() => deployOne(inst.instance_id, cfg.id, parseInt(document.getElementById(`ver-sel-${cfg.id}`).value), true)}>
+                                    onClick={() => deployOne(inst.instance_id, cfg.id, getSelectedVer(cfg.id), true)}>
                               Deploy+Restart
                             </button>
                           </span>

@@ -1,75 +1,98 @@
 """Keycloak authentication & authorization helpers for Flask."""
 import functools
 import logging
-import os
 
 import jwt
 import requests as http_requests
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, current_app, jsonify, request, g
 
 log = logging.getLogger(__name__)
 
 auth = Blueprint('auth', __name__, url_prefix='/api/auth')
 
-# ---------------------------------------------------------------------------
-# Keycloak configuration (read from env)
-# ---------------------------------------------------------------------------
-KEYCLOAK_URL = os.environ.get('KEYCLOAK_URL', 'http://localhost:8080')
-KEYCLOAK_REALM = os.environ.get('KEYCLOAK_REALM', 'svcmgr')
-KEYCLOAK_CLIENT_ID = os.environ.get('KEYCLOAK_CLIENT_ID', 'svcmgr-app')
-KEYCLOAK_CLIENT_SECRET = os.environ.get('KEYCLOAK_CLIENT_SECRET', '')
-
 _jwks_client = None
+_jwks_client_url = None
+
+
+def _kc_cfg():
+    """Read Keycloak config from Flask app.config."""
+    c = current_app.config
+    return (
+        c['KEYCLOAK_URL'],
+        c['KEYCLOAK_REALM'],
+        c['KEYCLOAK_CLIENT_ID'],
+        c.get('KEYCLOAK_CLIENT_SECRET', ''),
+    )
 
 
 def _keycloak_openid_url():
-    return f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect"
+    url, realm, *_ = _kc_cfg()
+    return f"{url}/realms/{realm}/protocol/openid-connect"
 
 
 def _get_jwks_client():
-    """Lazy-init JWKS client for token verification."""
-    global _jwks_client
-    if _jwks_client is None:
-        jwks_uri = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
-        _jwks_client = jwt.PyJWKClient(jwks_uri)
+    """Lazy-init JWKS client for token verification. Re-creates on URL change."""
+    global _jwks_client, _jwks_client_url
+    jwks_uri = f"{_keycloak_openid_url()}/certs"
+    if _jwks_client is None or _jwks_client_url != jwks_uri:
+        _jwks_client = jwt.PyJWKClient(jwks_uri, lifespan=300)
+        _jwks_client_url = jwks_uri
     return _jwks_client
 
 
 def _decode_token(token: str) -> dict:
     """Decode and verify a Keycloak JWT access token."""
+    _, _, client_id, _ = _kc_cfg()
     jwks = _get_jwks_client()
     signing_key = jwks.get_signing_key_from_jwt(token)
     return jwt.decode(
         token,
         signing_key.key,
         algorithms=["RS256"],
-        audience="account",
+        audience=["account", client_id],
         options={"verify_exp": True},
     )
 
 
+def _extract_token() -> str | None:
+    """Extract Bearer token from Authorization header or ?token= query param."""
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        parts = auth_header.split(' ', 1)
+        if len(parts) > 1 and parts[1].strip():
+            return parts[1].strip()
+    return request.args.get('token') or None
+
+
+def _verify_and_set_user(token: str):
+    """Decode token and populate g.user. Returns error tuple or None."""
+    try:
+        payload = _decode_token(token)
+        g.user = {
+            'sub': payload.get('sub'),
+            'username': payload.get('preferred_username', ''),
+            'email': payload.get('email', ''),
+            'name': payload.get('name', ''),
+            'roles': payload.get('realm_access', {}).get('roles', []),
+        }
+        return None
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
+    except Exception as e:
+        log.warning("JWT verification failed: %s", e)
+        return jsonify({"error": "Invalid token"}), 401
+
+
 def login_required(f):
-    """Decorator: require a valid Keycloak JWT in Authorization header."""
+    """Decorator: require a valid Keycloak JWT."""
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        auth_header = request.headers.get('Authorization', '')
-        if not auth_header.startswith('Bearer '):
+        token = _extract_token()
+        if not token:
             return jsonify({"error": "Authorization required"}), 401
-        token = auth_header.split(' ', 1)[1]
-        try:
-            payload = _decode_token(token)
-            g.user = {
-                'sub': payload.get('sub'),
-                'username': payload.get('preferred_username', ''),
-                'email': payload.get('email', ''),
-                'name': payload.get('name', ''),
-                'roles': payload.get('realm_access', {}).get('roles', []),
-            }
-        except jwt.ExpiredSignatureError:
-            return jsonify({"error": "Token expired"}), 401
-        except Exception as e:
-            log.warning("JWT verification failed: %s", e)
-            return jsonify({"error": "Invalid token"}), 401
+        err = _verify_and_set_user(token)
+        if err:
+            return err
         return f(*args, **kwargs)
     return wrapper
 
@@ -102,15 +125,16 @@ def do_login():
     if not username or not password:
         return jsonify({"error": "Username and password are required"}), 400
 
+    _, _, client_id, client_secret = _kc_cfg()
     token_url = f"{_keycloak_openid_url()}/token"
     payload = {
         'grant_type': 'password',
-        'client_id': KEYCLOAK_CLIENT_ID,
+        'client_id': client_id,
         'username': username,
         'password': password,
     }
-    if KEYCLOAK_CLIENT_SECRET:
-        payload['client_secret'] = KEYCLOAK_CLIENT_SECRET
+    if client_secret:
+        payload['client_secret'] = client_secret
 
     try:
         resp = http_requests.post(token_url, data=payload, timeout=10)
@@ -140,14 +164,15 @@ def do_refresh():
     if not refresh_token:
         return jsonify({"error": "refresh_token is required"}), 400
 
+    _, _, client_id, client_secret = _kc_cfg()
     token_url = f"{_keycloak_openid_url()}/token"
     payload = {
         'grant_type': 'refresh_token',
-        'client_id': KEYCLOAK_CLIENT_ID,
+        'client_id': client_id,
         'refresh_token': refresh_token,
     }
-    if KEYCLOAK_CLIENT_SECRET:
-        payload['client_secret'] = KEYCLOAK_CLIENT_SECRET
+    if client_secret:
+        payload['client_secret'] = client_secret
 
     try:
         resp = http_requests.post(token_url, data=payload, timeout=10)
@@ -174,13 +199,14 @@ def do_logout():
     refresh_token = data.get('refresh_token', '')
 
     if refresh_token:
+        _, _, client_id, client_secret = _kc_cfg()
         logout_url = f"{_keycloak_openid_url()}/logout"
         payload = {
-            'client_id': KEYCLOAK_CLIENT_ID,
+            'client_id': client_id,
             'refresh_token': refresh_token,
         }
-        if KEYCLOAK_CLIENT_SECRET:
-            payload['client_secret'] = KEYCLOAK_CLIENT_SECRET
+        if client_secret:
+            payload['client_secret'] = client_secret
         try:
             http_requests.post(logout_url, data=payload, timeout=5)
         except http_requests.RequestException:

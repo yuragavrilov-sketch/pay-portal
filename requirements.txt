@@ -8,3 +8,5 @@ cryptography==43.0.3
 requests==2.32.3
 Werkzeug==3.0.6
 PyJWT==2.9.0
+gunicorn==22.0.0
+gevent==24.2.1

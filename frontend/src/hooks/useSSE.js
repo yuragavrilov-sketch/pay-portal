@@ -1,6 +1,13 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
 
 export default function useSSE(url, onMessage, onError) {
+  const onMessageRef = useRef(onMessage);
+  const onErrorRef = useRef(onError);
+
+  // Keep refs current to avoid stale closures
+  useEffect(() => { onMessageRef.current = onMessage; }, [onMessage]);
+  useEffect(() => { onErrorRef.current = onError; }, [onError]);
+
   const esRef = useRef(null);
 
   useEffect(() => {
@@ -12,14 +19,15 @@ export default function useSSE(url, onMessage, onError) {
       try {
         const data = JSON.parse(e.data);
         if (data.type === 'heartbeat') return;
-        onMessage(data, es);
+        onMessageRef.current?.(data, es);
       } catch {}
     };
 
     es.onerror = () => {
       es.close();
       esRef.current = null;
-      onError?.();
+      // SSE doesn't expose HTTP status; clear auth on connection failure
+      onErrorRef.current?.();
     };
 
     return () => {

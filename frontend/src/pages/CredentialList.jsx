@@ -1,20 +1,28 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../api';
 import Confirm from '../components/Confirm';
+import useFetch from '../hooks/useFetch';
 
 export default function CredentialList() {
-  const [creds, setCreds] = useState([]);
+  const { data, error, loading, reload } = useFetch(() => api.credList());
+  const creds = data?.credentials || [];
   const [delId, setDelId] = useState(null);
-
-  const load = () => api.credList().then(d => setCreds(d.credentials)).catch(() => {});
-  useEffect(() => { load(); }, []);
+  const [delError, setDelError] = useState('');
 
   const doDelete = async () => {
-    try { await api.credDelete(delId); } catch {}
-    setDelId(null);
-    load();
+    setDelError('');
+    try {
+      await api.credDelete(delId);
+      setDelId(null);
+      reload();
+    } catch (e) {
+      setDelError(e.message);
+    }
   };
+
+  if (loading) return <div className="text-center py-5"><div className="spinner-border"></div></div>;
+  if (error) return <div className="alert alert-danger"><i className="bi bi-exclamation-triangle me-2"></i>{error}</div>;
 
   return (
     <div>
@@ -24,6 +32,7 @@ export default function CredentialList() {
           <i className="bi bi-plus-lg me-1"></i>Создать
         </Link>
       </div>
+      {delError && <div className="alert alert-danger">{delError}</div>}
       <table className="table table-hover">
         <thead><tr><th>Название</th><th>Имя пользователя</th><th>Серверов</th><th>Обновлено</th><th></th></tr></thead>
         <tbody>

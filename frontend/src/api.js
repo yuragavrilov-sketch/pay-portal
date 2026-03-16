@@ -1,32 +1,73 @@
 const BASE = '/api';
+const TOKEN_KEY = 'svcmgr_access_token';
+const REFRESH_KEY = 'svcmgr_refresh_token';
+const USER_KEY = 'svcmgr_user';
 
 function getToken() {
-  return localStorage.getItem('svcmgr_access_token');
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+// --- Token refresh with mutex to prevent concurrent refreshes ---
+let refreshPromise = null;
+
+async function refreshAccessToken() {
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    const rt = localStorage.getItem(REFRESH_KEY);
+    if (!rt) return null;
+
+    try {
+      const resp = await fetch(BASE + '/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: rt }),
+      });
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      localStorage.setItem(TOKEN_KEY, data.access_token);
+      localStorage.setItem(REFRESH_KEY, data.refresh_token);
+      return data.access_token;
+    } catch {
+      return null;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
+function clearAuth() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(USER_KEY);
+  window.location.href = '/login';
 }
 
 async function request(method, path, body) {
-  const opts = { method, headers: {} };
+  const doFetch = (token) => {
+    const opts = { method, headers: {} };
+    if (token) opts.headers['Authorization'] = `Bearer ${token}`;
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(BASE + path, opts);
+  };
 
-  // Attach JWT token
-  const token = getToken();
-  if (token) {
-    opts.headers['Authorization'] = `Bearer ${token}`;
-  }
+  let r = await doFetch(getToken());
 
-  if (body !== undefined) {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(body);
-  }
-
-  const r = await fetch(BASE + path, opts);
-
-  // On 401 — redirect to login
+  // On 401 — try refresh once, then retry
   if (r.status === 401) {
-    localStorage.removeItem('svcmgr_access_token');
-    localStorage.removeItem('svcmgr_refresh_token');
-    localStorage.removeItem('svcmgr_user');
-    window.location.href = '/login';
-    throw new Error('Session expired');
+    const newToken = await refreshAccessToken();
+    if (newToken) {
+      r = await doFetch(newToken);
+    }
+    if (r.status === 401) {
+      clearAuth();
+      throw new Error('Session expired');
+    }
   }
 
   if (!r.ok) {
@@ -120,7 +161,7 @@ const api = {
   // Audit
   auditList: (params) => api.get('/audit?' + new URLSearchParams(params).toString()),
 
-  // SSE stream URL (not a fetch call — token appended as query param)
+  // SSE stream URL (token appended as query param for EventSource)
   taskStreamUrl: (taskId) => {
     const token = getToken();
     const base = `/api/manage/tasks/${taskId}/stream`;

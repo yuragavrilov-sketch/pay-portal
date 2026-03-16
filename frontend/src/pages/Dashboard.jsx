@@ -6,11 +6,14 @@ import { useEnv } from '../context/EnvContext';
 export default function Dashboard() {
   const { currentEnv } = useEnv();
   const [stats, setStats] = useState(null);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    api.dashboard().then(setStats).catch(() => {});
+    setError('');
+    api.dashboard().then(setStats).catch(e => setError(e.message));
   }, [currentEnv]);
 
+  if (error) return <div className="alert alert-danger mt-3"><i className="bi bi-exclamation-triangle me-2"></i>{error}</div>;
   if (!stats) return <div className="text-center py-5"><div className="spinner-border"></div></div>;
 
   const cards = [

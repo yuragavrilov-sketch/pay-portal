@@ -1,5 +1,6 @@
 """WinRM utilities: connectivity check, service queries, file fetching."""
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -13,6 +14,21 @@ except ImportError:
 
 class WinRMError(Exception):
     pass
+
+
+_SAFE_NAME_RE = re.compile(r'^[a-zA-Z0-9_.@() -]+$')
+
+
+def _sanitize_service_name(name: str) -> str:
+    """Validate service name against PowerShell injection."""
+    if not name or not _SAFE_NAME_RE.match(name):
+        raise WinRMError(f"Invalid service name: {name!r}")
+    return name
+
+
+def _escape_ps_path(path: str) -> str:
+    """Escape a file/directory path for safe PowerShell string interpolation."""
+    return path.replace("'", "''").replace('"', '`"')
 
 
 def _get_session(server) -> 'winrm.Session':
@@ -61,9 +77,10 @@ def get_service_info(server, win_service_name: str) -> dict:
         result['error'] = "pywinrm not installed"
         return result
     try:
+        safe_name = _sanitize_service_name(win_service_name)
         session = _get_session(server)
         ps = f"""
-$svc = Get-WmiObject Win32_Service -Filter "Name='{win_service_name}'"
+$svc = Get-WmiObject Win32_Service -Filter "Name='{safe_name}'"
 if ($svc) {{
     Write-Output "NAME:$($svc.Name)"
     Write-Output "DISPLAY:$($svc.DisplayName)"
@@ -110,8 +127,9 @@ def list_config_files(server, config_dir: str) -> list[dict]:
         return []
     try:
         session = _get_session(server)
+        safe_dir = _escape_ps_path(config_dir)
         ps = f"""
-$dir = "{config_dir}"
+$dir = "{safe_dir}"
 if (Test-Path $dir) {{
     Get-ChildItem -Path $dir -File | ForEach-Object {{
         Write-Output "$($_.Name)|$($_.FullName)"
@@ -144,7 +162,8 @@ def fetch_file_content(server, filepath: str) -> tuple[Optional[str], str]:
     try:
         session = _get_session(server)
         # Read as raw bytes via base64 – works regardless of file encoding
-        ps = f'[Convert]::ToBase64String([IO.File]::ReadAllBytes("{filepath}"))'
+        safe_path = _escape_ps_path(filepath)
+        ps = f'[Convert]::ToBase64String([IO.File]::ReadAllBytes("{safe_path}"))'
         r = session.run_ps(ps)
         if r.status_code != 0:
             return None, 'utf-8'
@@ -192,8 +211,9 @@ def write_file_content(server, filepath: str, content: str, encoding: str = 'utf
         session = _get_session(server)
         raw = content.encode(encoding, errors='replace')
         b64 = base64.b64encode(raw).decode('ascii')
+        safe_path = _escape_ps_path(filepath)
         ps = f"""$bytes = [System.Convert]::FromBase64String('{b64}')
-[System.IO.File]::WriteAllBytes("{filepath}", $bytes)
+[System.IO.File]::WriteAllBytes("{safe_path}", $bytes)
 """
         r = session.run_ps(ps)
         if r.status_code == 0:
@@ -244,8 +264,9 @@ def get_service_status(server, win_service_name: str) -> str:
         return 'unknown'
     try:
         session = _get_session(server)
+        safe_name = _sanitize_service_name(win_service_name)
         ps = f"""
-$s = Get-Service -Name '{win_service_name}' -ErrorAction SilentlyContinue
+$s = Get-Service -Name '{safe_name}' -ErrorAction SilentlyContinue
 if ($s) {{ Write-Output $s.Status }} else {{ Write-Output 'NotFound' }}
 """
         r = session.run_ps(ps)
@@ -265,10 +286,11 @@ def control_service(server, win_service_name: str, action: str) -> tuple[bool, s
     if not WINRM_AVAILABLE:
         return False, "pywinrm not installed"
     action = action.lower()
+    safe_name = _sanitize_service_name(win_service_name)
     ps_cmd = {
-        'start':   f"Start-Service -Name '{win_service_name}' -ErrorAction Stop",
-        'stop':    f"Stop-Service  -Name '{win_service_name}' -Force -ErrorAction Stop",
-        'restart': f"Restart-Service -Name '{win_service_name}' -Force -ErrorAction Stop",
+        'start':   f"Start-Service -Name '{safe_name}' -ErrorAction Stop",
+        'stop':    f"Stop-Service  -Name '{safe_name}' -Force -ErrorAction Stop",
+        'restart': f"Restart-Service -Name '{safe_name}' -Force -ErrorAction Stop",
     }.get(action)
     if not ps_cmd:
         return False, f"Unknown action: {action}"

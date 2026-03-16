@@ -1,8 +1,11 @@
 """REST API Blueprint — JSON endpoints for the React frontend."""
 import json
+import logging
 import queue
 import threading
 import uuid
+
+log = logging.getLogger(__name__)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -12,7 +15,8 @@ from models import (
     ServiceInstance, InstanceConfig, ServiceConfig, ServiceConfigVersion,
     _next_version,
 )
-from auth import _decode_token
+from auth import _extract_token, _verify_and_set_user
+import winrm_utils
 
 # In-memory task registry shared across routes
 _tasks: dict = {}
@@ -25,26 +29,12 @@ api = Blueprint('api', __name__, url_prefix='/api')
 # ---------------------------------------------------------------------------
 @api.before_request
 def _require_auth():
-    # Accept token from Authorization header or ?token= query param (for SSE / EventSource)
-    auth_header = request.headers.get('Authorization', '')
-    if auth_header.startswith('Bearer '):
-        token = auth_header.split(' ', 1)[1]
-    else:
-        token = request.args.get('token', '')
-
+    token = _extract_token()
     if not token:
         return jsonify({"error": "Authorization required"}), 401
-    try:
-        payload = _decode_token(token)
-        g.user = {
-            'sub': payload.get('sub'),
-            'username': payload.get('preferred_username', ''),
-            'email': payload.get('email', ''),
-            'name': payload.get('name', ''),
-            'roles': payload.get('realm_access', {}).get('roles', []),
-        }
-    except Exception:
-        return jsonify({"error": "Invalid or expired token"}), 401
+    err = _verify_and_set_user(token)
+    if err:
+        return err
 
 
 # ---------------------------------------------------------------------------
@@ -63,17 +53,19 @@ def _audit(action, entity_type, entity_id=None, entity_name='',
     try:
         user = getattr(g, 'user', None)
         username = user.get('username', '') if user else ''
-        entry = AuditLog(
-            action=action, entity_type=entity_type,
-            entity_id=entity_id, entity_name=entity_name,
-            details=details, result=result,
-            ip_address=_client_ip(),
-            username=username,
-        )
-        db.session.add(entry)
+        with db.session.begin_nested():
+            entry = AuditLog(
+                action=action, entity_type=entity_type,
+                entity_id=entity_id, entity_name=entity_name,
+                details=details, result=result,
+                ip_address=_client_ip(),
+                username=username,
+            )
+            db.session.add(entry)
         db.session.commit()
     except Exception:
-        pass
+        log.exception("Audit log write failed: %s %s #%s", action, entity_type, entity_id)
+        db.session.rollback()
 
 
 # ===== ENV CONTEXT =========================================================
@@ -283,7 +275,7 @@ def server_get(sid):
 
 @api.route('/servers', methods=['POST'])
 def server_create():
-    import winrm_utils
+
     d = request.get_json(force=True)
     env_ids = d.get('env_ids', [])
     server = Server(
@@ -334,7 +326,7 @@ def server_delete(sid):
 
 @api.route('/servers/<int:sid>/test', methods=['POST'])
 def server_test(sid):
-    import winrm_utils
+
     server = Server.query.get_or_404(sid)
     ok, msg = winrm_utils.test_connection(server)
     server.is_available = ok
@@ -347,7 +339,7 @@ def server_test(sid):
 
 @api.route('/servers/<int:sid>/services')
 def server_services(sid):
-    import winrm_utils
+
     server = Server.query.get_or_404(sid)
     services, error = winrm_utils.list_services(server)
     if error:
@@ -506,7 +498,7 @@ def cfg_create(sid):
     )
     db.session.add(ver)
     db.session.commit()
-    _audit(AuditLog.ACTION_CREATE, 'service_config', cfg.id, filename,
+    _audit(AuditLog.ACTION_CREATE, AuditLog.ENTITY_CONFIG, cfg.id, filename,
            details=f'service={svc.name} v1')
     return jsonify({'id': cfg.id}), 201
 
@@ -540,7 +532,7 @@ def cfg_update(sid, cid):
     )
     db.session.add(ver)
     db.session.commit()
-    _audit(AuditLog.ACTION_UPDATE, 'service_config', cfg.id, cfg.filename,
+    _audit(AuditLog.ACTION_UPDATE, AuditLog.ENTITY_CONFIG, cfg.id, cfg.filename,
            details=f'service={svc.name} v{next_v}')
     return jsonify({'ok': True, 'version': next_v})
 
@@ -551,7 +543,7 @@ def cfg_delete(sid, cid):
     filename = cfg.filename
     db.session.delete(cfg)
     db.session.commit()
-    _audit(AuditLog.ACTION_DELETE, 'service_config', cid, filename)
+    _audit(AuditLog.ACTION_DELETE, AuditLog.ENTITY_CONFIG, cid, filename)
     return jsonify({'ok': True})
 
 
@@ -581,7 +573,7 @@ def cfg_version_activate(sid, cid, vid):
     cfg.content = ver.content
     cfg.updated_at = datetime.utcnow()
     db.session.commit()
-    _audit(AuditLog.ACTION_ROLLBACK_CONFIG, 'service_config', cfg.id, cfg.filename,
+    _audit(AuditLog.ACTION_ROLLBACK_CONFIG, AuditLog.ENTITY_CONFIG, cfg.id, cfg.filename,
            details=f'service={svc.name} rollback to v{ver.version}')
     return jsonify({'ok': True})
 
@@ -691,7 +683,7 @@ def inst_delete(iid):
 
 @api.route('/instances/<int:iid>/refresh-status', methods=['POST'])
 def inst_refresh_status(iid):
-    import winrm_utils
+
     inst = ServiceInstance.query.get_or_404(iid)
     status = winrm_utils.get_service_status(inst.server, inst.win_service_name)
     inst.status = status
@@ -702,7 +694,7 @@ def inst_refresh_status(iid):
 
 @api.route('/instances/<int:iid>/refresh-configs', methods=['POST'])
 def inst_refresh_configs(iid):
-    import winrm_utils
+
     inst = ServiceInstance.query.get_or_404(iid)
     if not inst.config_dir:
         return jsonify({'ok': False, 'message': 'config_dir не задан'})
@@ -926,7 +918,7 @@ def _take_snapshot(inst, trigger, _ip='system'):
 
 @api.route('/manage/instances/<int:iid>/control', methods=['POST'])
 def manage_control(iid):
-    import winrm_utils
+
     inst = ServiceInstance.query.get_or_404(iid)
     data = request.get_json(silent=True) or {}
     action = data.get('action', '')
@@ -977,7 +969,7 @@ def manage_control(iid):
 
 @api.route('/manage/services/<int:sid>/control', methods=['POST'])
 def manage_svc_control(sid):
-    import winrm_utils
+
     svc = Service.query.get_or_404(sid)
     data = request.get_json(silent=True) or {}
     action = data.get('action', '')
@@ -1054,7 +1046,7 @@ def manage_svc_control(sid):
 
 @api.route('/services/<int:sid>/configs/<int:cid>/push', methods=['POST'])
 def cfg_push(sid, cid):
-    import winrm_utils
+
     svc = Service.query.get_or_404(sid)
     cfg = ServiceConfig.query.filter_by(id=cid, service_id=sid).first_or_404()
     cur_ver = cfg.current_version
@@ -1075,6 +1067,8 @@ def cfg_push(sid, cid):
     tq: queue.Queue = queue.Queue()
     _tasks[task_id] = {'q': tq, 'done': False}
     client_ip = _client_ip()
+    user = getattr(g, 'user', None)
+    push_username = user.get('username', '') if user else ''
     inst_ids = [i.id for i in instances]
     ver_id = cur_ver.id
     ver_num = cur_ver.version
@@ -1141,8 +1135,24 @@ def cfg_push(sid, cid):
                                'hostname': '?', 'win_name': '?'}
                         results.append(err)
                         tq.put({'type': 'instance_done', **err})
-            tq.put({'type': 'done_all', 'ok': all(r['ok'] for r in results),
+            all_ok = all(r['ok'] for r in results)
+            tq.put({'type': 'done_all', 'ok': all_ok,
                     'results': results, 'cfg_filename': cfg_fname, 'version': ver_num})
+            # Audit log for config push
+            with app.app_context():
+                ok_count = sum(1 for r in results if r.get('ok'))
+                entry = AuditLog(
+                    action=AuditLog.ACTION_PUSH_CONFIG,
+                    entity_type=AuditLog.ENTITY_CONFIG,
+                    entity_id=cid,
+                    entity_name=cfg_fname,
+                    details=f'service={svc_name} v{ver_num} -> {ok_count}/{len(results)} instances',
+                    result=AuditLog.RESULT_OK if all_ok else AuditLog.RESULT_WARNING,
+                    ip_address=client_ip,
+                    username=push_username,
+                )
+                db.session.add(entry)
+                db.session.commit()
         except Exception as exc:
             tq.put({'type': 'done_all', 'ok': False, 'results': results, 'error': str(exc)})
         finally:
@@ -1156,7 +1166,7 @@ def cfg_push(sid, cid):
 
 @api.route('/instances', methods=['POST'])
 def inst_create():
-    import winrm_utils
+
     data = request.get_json(silent=True) or {}
     items = data.get('items', [])
     if not items:
@@ -1254,7 +1264,7 @@ def inst_create():
 
 @api.route('/manage/services/<int:sid>/config-deploy', methods=['POST'])
 def manage_svc_deploy(sid):
-    import winrm_utils
+
     svc = Service.query.get_or_404(sid)
     data = request.get_json(silent=True) or {}
     cfg_id = data.get('cfg_id')
@@ -1372,7 +1382,7 @@ def manage_svc_deploy(sid):
 
 @api.route('/manage/instances/<int:iid>/config-deploy', methods=['POST'])
 def manage_inst_deploy(iid):
-    import winrm_utils
+
     inst = ServiceInstance.query.get_or_404(iid)
     data = request.get_json(silent=True) or {}
     cfg_id = data.get('cfg_id')
@@ -1493,7 +1503,7 @@ def manage_snap_restore(snap_id):
 
 @api.route('/manage/instances/<int:iid>/config-diff')
 def manage_cfg_diff(iid):
-    import winrm_utils
+
     inst = ServiceInstance.query.get_or_404(iid)
     filename = request.args.get('filename', '').strip()
     if not filename:
@@ -1521,7 +1531,7 @@ def manage_cfg_diff(iid):
 
 @api.route('/instances/scan-configs', methods=['POST'])
 def inst_scan_configs():
-    import winrm_utils
+
     data = request.get_json(silent=True) or {}
     env_id = data.get('env_id')
     q_inst = ServiceInstance.query.join(Server)

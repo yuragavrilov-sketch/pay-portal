@@ -12,7 +12,9 @@ export function EnvProvider({ children }) {
       const data = await api.currentEnv();
       setCurrentEnv(data.current_env);
       setEnvironments(data.environments);
-    } catch {}
+    } catch (e) {
+      console.error('Failed to load environments:', e.message);
+    }
   }, []);
 
   useEffect(() => { reload(); }, [reload]);

@@ -17,7 +17,7 @@ export default function ServerForm() {
     if (isEdit) {
       api.serverGet(id).then(d => setForm({
         hostname: d.hostname, port: d.port, use_ssl: d.use_ssl,
-        credential_id: d.credential_id, env_ids: d.env_ids || [], description: d.description || '',
+        credential_id: String(d.credential_id ?? ''), env_ids: d.env_ids || [], description: d.description || '',
       })).catch(e => setError(e.message));
     }
   }, [id]);
@@ -33,8 +33,9 @@ export default function ServerForm() {
     e.preventDefault();
     setError('');
     try {
-      if (isEdit) await api.serverUpdate(id, form);
-      else await api.serverCreate(form);
+      const payload = { ...form, credential_id: parseInt(form.credential_id, 10) };
+      if (isEdit) await api.serverUpdate(id, payload);
+      else await api.serverCreate(payload);
       navigate('/servers');
     } catch (err) { setError(err.message); }
   };
@@ -53,7 +54,7 @@ export default function ServerForm() {
           <div className="col">
             <label className="form-label">Порт WinRM</label>
             <input className="form-control" type="number" value={form.port}
-                   onChange={e => setForm({ ...form, port: parseInt(e.target.value) || 5985 })} />
+                   onChange={e => setForm({ ...form, port: parseInt(e.target.value, 10) || 5985 })} />
           </div>
           <div className="col d-flex align-items-end">
             <div className="form-check">
@@ -66,7 +67,7 @@ export default function ServerForm() {
         <div className="mb-3">
           <label className="form-label">Учётная запись</label>
           <select className="form-select" value={form.credential_id} required
-                  onChange={e => setForm({ ...form, credential_id: parseInt(e.target.value) })}>
+                  onChange={e => setForm({ ...form, credential_id: e.target.value })}>
             <option value="">— выберите —</option>
             {creds.map(c => <option key={c.id} value={c.id}>{c.name} ({c.username})</option>)}
           </select>
