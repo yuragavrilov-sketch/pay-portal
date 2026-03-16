@@ -366,6 +366,74 @@ def server_services(sid):
     return jsonify({'ok': True, 'error': None, 'services': services})
 
 
+@api.route('/servers/discover', methods=['POST'])
+def servers_discover():
+    """Discover Windows services on multiple servers in parallel.
+
+    Body: { "server_ids": [1, 2, 3] }
+    Uses SSE task stream for real-time results.
+    """
+    data = request.get_json(silent=True) or {}
+    server_ids = data.get('server_ids', [])
+    if not server_ids:
+        return jsonify({'ok': False, 'error': 'server_ids обязателен'}), 400
+
+    # Collect already-registered instance names to mark duplicates
+    existing = set()
+    for row in db.session.query(ServiceInstance.server_id, ServiceInstance.win_service_name).all():
+        existing.add((row.server_id, row.win_service_name))
+
+    task_id = str(uuid.uuid4())
+    tq: queue.Queue = queue.Queue()
+    _tasks[task_id] = {'q': tq, 'done': False}
+    app = current_app._get_current_object()
+
+    def discover_one(sid):
+        with app.app_context():
+            server = db.session.get(Server, int(sid))
+            if not server:
+                tq.put({'type': 'server_done', 'server_id': sid,
+                        'ok': False, 'hostname': str(sid),
+                        'error': 'Сервер не найден', 'services': []})
+                return
+            try:
+                services, error = winrm_utils.list_services(server)
+                if error:
+                    tq.put({'type': 'server_done', 'server_id': server.id,
+                            'ok': False, 'hostname': server.hostname,
+                            'error': error, 'services': []})
+                    return
+                svc_list = []
+                for s in (services or []):
+                    svc_list.append({
+                        'name': s.get('name', ''),
+                        'display_name': s.get('display_name', ''),
+                        'status': s.get('status', ''),
+                        'already_registered': (server.id, s.get('name', '')) in existing,
+                    })
+                tq.put({'type': 'server_done', 'server_id': server.id,
+                        'ok': True, 'hostname': server.hostname,
+                        'error': None, 'services': svc_list})
+            except Exception as exc:
+                tq.put({'type': 'server_done', 'server_id': server.id,
+                        'ok': False, 'hostname': server.hostname,
+                        'error': str(exc), 'services': []})
+
+    def worker():
+        try:
+            max_w = max(1, min(len(server_ids), 8))
+            with ThreadPoolExecutor(max_workers=max_w) as pool:
+                list(pool.map(discover_one, server_ids))
+            tq.put({'type': 'done_all', 'ok': True})
+        except Exception as exc:
+            tq.put({'type': 'done_all', 'ok': False, 'error': str(exc)})
+        finally:
+            _tasks.get(task_id, {})['done'] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({'task_id': task_id})
+
+
 # ===== SERVICES =============================================================
 
 @api.route('/services')

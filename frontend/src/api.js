@@ -115,6 +115,7 @@ const api = {
   serverDelete:   (id)       => api.del(`/servers/${id}`),
   serverTest:     (id)       => api.post(`/servers/${id}/test`),
   serverServices: (id)       => api.get(`/servers/${id}/services`),
+  serversDiscover:(d)        => api.post('/servers/discover', d),
 
   // Services
   svcList:    ()         => api.get('/services'),
