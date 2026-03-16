@@ -48,17 +48,29 @@ def _client_ip():
     )
 
 
+def _current_username():
+    """Extract username from Flask g (request context) if available."""
+    user = getattr(g, 'user', None)
+    return user.get('username', '') if user else ''
+
+
 def _audit(action, entity_type, entity_id=None, entity_name='',
-           details='', result=AuditLog.RESULT_OK):
+           details='', result=AuditLog.RESULT_OK,
+           username=None, ip_address=None):
     try:
-        user = getattr(g, 'user', None)
-        username = user.get('username', '') if user else ''
+        if username is None:
+            username = _current_username()
+        if ip_address is None:
+            try:
+                ip_address = _client_ip()
+            except RuntimeError:
+                ip_address = ''
         with db.session.begin_nested():
             entry = AuditLog(
                 action=action, entity_type=entity_type,
                 entity_id=entity_id, entity_name=entity_name,
                 details=details, result=result,
-                ip_address=_client_ip(),
+                ip_address=ip_address,
                 username=username,
             )
             db.session.add(entry)
@@ -108,12 +120,19 @@ def dashboard():
     else:
         server_count = Server.query.count()
         instance_count = ServiceInstance.query.count()
+    recent = AuditLog.query.order_by(AuditLog.created_at.desc()).limit(10).all()
     return jsonify({
         'env_count': Environment.query.count(),
         'server_count': server_count,
         'instance_count': instance_count,
         'service_count': Service.query.count(),
         'cred_count': Credential.query.count(),
+        'recent_audit': [{
+            'id': r.id, 'action': r.action, 'entity_type': r.entity_type,
+            'entity_name': r.entity_name or '', 'result': r.result,
+            'username': r.username or '',
+            'created_at': r.created_at.strftime('%d.%m.%Y %H:%M') if r.created_at else '',
+        } for r in recent],
     })
 
 
@@ -791,12 +810,16 @@ def audit_list():
         query = query.filter(AuditLog.entity_type == entity)
     if result:
         query = query.filter(AuditLog.result == result)
+    username_filter = request.args.get('username', '').strip()
+    if username_filter:
+        query = query.filter(AuditLog.username == username_filter)
     if search:
         like = f'%{search}%'
         query = query.filter(db.or_(
             AuditLog.entity_name.ilike(like),
             AuditLog.details.ilike(like),
             AuditLog.ip_address.ilike(like),
+            AuditLog.username.ilike(like),
         ))
     pagination = query.order_by(AuditLog.created_at.desc()).paginate(
         page=page, per_page=50, error_out=False)
@@ -806,9 +829,14 @@ def audit_list():
             'entity_id': r.entity_id, 'entity_name': r.entity_name or '',
             'details': r.details or '', 'result': r.result,
             'ip_address': r.ip_address or '',
+            'username': r.username or '',
             'created_at': r.created_at.strftime('%d.%m.%Y %H:%M:%S') if r.created_at else '',
         } for r in pagination.items],
         'page': pagination.page, 'pages': pagination.pages, 'total': pagination.total,
+        'usernames': sorted(
+            u for (u,) in db.session.query(db.distinct(AuditLog.username))
+            .filter(AuditLog.username.isnot(None), AuditLog.username != '').all()
+        ),
     })
 
 
@@ -899,7 +927,7 @@ _ACTION_META = {
 }
 
 
-def _take_snapshot(inst, trigger, _ip='system'):
+def _take_snapshot(inst, trigger, _ip='system', _username=''):
     configs_data = [
         {'filename': c.filename, 'filepath': c.filepath, 'content': c.content}
         for c in inst.configs
@@ -912,7 +940,8 @@ def _take_snapshot(inst, trigger, _ip='system'):
     _audit(AuditLog.ACTION_SNAPSHOT, AuditLog.ENTITY_SNAPSHOT,
            inst.id, inst.win_service_name,
            details=f'перед операцией: {_ACTION_META.get(trigger, (None, trigger))[1]}'
-                   f' | server={inst.server.hostname} | файлов: {len(configs_data)}')
+                   f' | server={inst.server.hostname} | файлов: {len(configs_data)}',
+           username=_username, ip_address=_ip)
     return snap
 
 
@@ -929,6 +958,7 @@ def manage_control(iid):
     q: queue.Queue = queue.Queue()
     _tasks[task_id] = {'q': q, 'done': False}
     client_ip = _client_ip()
+    req_username = _current_username()
     inst_id = inst.id
     action_const, action_label = _ACTION_META[action]
     app = current_app._get_current_object()
@@ -943,7 +973,7 @@ def manage_control(iid):
                     return
                 q.put({'type': 'progress', 'instance_id': inst_id,
                        'message': 'Снимаю снэпшот конфигурации...'})
-                snap = _take_snapshot(inst_w, action, _ip=client_ip)
+                snap = _take_snapshot(inst_w, action, _ip=client_ip, _username=req_username)
                 q.put({'type': 'progress', 'instance_id': inst_id,
                        'message': f'{action_label}...', 'snap_id': snap.id})
                 ok, msg = winrm_utils.control_service(inst_w.server, inst_w.win_service_name, action)
@@ -954,7 +984,8 @@ def manage_control(iid):
                 db.session.commit()
                 _audit(action_const, AuditLog.ENTITY_INSTANCE, inst_w.id, inst_w.win_service_name,
                        details=f'server={inst_w.server.hostname} | статус: {new_status}',
-                       result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR)
+                       result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
+                       username=req_username, ip_address=client_ip)
                 q.put({'type': 'done', 'instance_id': inst_id, 'ok': ok,
                        'message': msg, 'status': new_status, 'snap_id': snap.id})
         except Exception as exc:
@@ -986,6 +1017,7 @@ def manage_svc_control(sid):
     q: queue.Queue = queue.Queue()
     _tasks[task_id] = {'q': q, 'done': False}
     client_ip = _client_ip()
+    req_username = _current_username()
     action_const, action_label = _ACTION_META[action]
     app = current_app._get_current_object()
 
@@ -999,7 +1031,7 @@ def manage_svc_control(sid):
                 return r
             q.put({'type': 'progress', 'instance_id': iid,
                    'message': f'[{inst_w.win_service_name}] Снэпшот...'})
-            snap = _take_snapshot(inst_w, action, _ip=client_ip)
+            snap = _take_snapshot(inst_w, action, _ip=client_ip, _username=req_username)
             q.put({'type': 'progress', 'instance_id': iid,
                    'message': f'[{inst_w.win_service_name}] {action_label}...', 'snap_id': snap.id})
             ok, msg = winrm_utils.control_service(inst_w.server, inst_w.win_service_name, action)
@@ -1009,7 +1041,8 @@ def manage_svc_control(sid):
             db.session.commit()
             _audit(action_const, AuditLog.ENTITY_INSTANCE, inst_w.id, inst_w.win_service_name,
                    details=f'server={inst_w.server.hostname} | статус: {new_status}',
-                   result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR)
+                   result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
+                   username=req_username, ip_address=client_ip)
             r = {'instance_id': iid, 'ok': ok, 'message': msg,
                  'status': new_status, 'snap_id': snap.id}
             q.put({'type': 'instance_done', **r})
@@ -1067,8 +1100,7 @@ def cfg_push(sid, cid):
     tq: queue.Queue = queue.Queue()
     _tasks[task_id] = {'q': tq, 'done': False}
     client_ip = _client_ip()
-    user = getattr(g, 'user', None)
-    push_username = user.get('username', '') if user else ''
+    push_username = _current_username()
     inst_ids = [i.id for i in instances]
     ver_id = cur_ver.id
     ver_num = cur_ver.version
@@ -1176,6 +1208,7 @@ def inst_create():
     tq: queue.Queue = queue.Queue()
     _tasks[task_id] = {'q': tq, 'done': False}
     client_ip = _client_ip()
+    req_username = _current_username()
     app = current_app._get_current_object()
 
     def process_one(idx_item):
@@ -1221,7 +1254,8 @@ def inst_create():
                 db.session.commit()
                 _audit(AuditLog.ACTION_CREATE, AuditLog.ENTITY_INSTANCE,
                        inst.id, win_name,
-                       details=f'server={server.hostname} configs={cfg_count}')
+                       details=f'server={server.hostname} configs={cfg_count}',
+                       username=req_username, ip_address=client_ip)
                 r = {'index': idx, 'ok': True, 'win_name': win_name,
                      'hostname': server.hostname, 'message': f'Конфигов: {cfg_count}'}
                 tq.put({'type': 'item_done', **r})
@@ -1287,6 +1321,7 @@ def manage_svc_deploy(sid):
     tq: queue.Queue = queue.Queue()
     _tasks[task_id] = {'q': tq, 'done': False}
     client_ip = _client_ip()
+    req_username = _current_username()
     inst_ids = [i.id for i in instances]
     _ver_id = ver.id
     ver_num = ver.version
@@ -1369,8 +1404,16 @@ def manage_svc_deploy(sid):
                                'hostname': '?', 'win_name': '?', 'status': 'unknown'}
                         results.append(err)
                         tq.put({'type': 'instance_done', **err})
-            tq.put({'type': 'done_all', 'ok': all(r['ok'] for r in results),
+            all_ok = all(r['ok'] for r in results)
+            tq.put({'type': 'done_all', 'ok': all_ok,
                     'results': results, 'cfg_filename': cfg_fname, 'version': ver_num})
+            with app.app_context():
+                ok_count = sum(1 for r in results if r.get('ok'))
+                _audit(AuditLog.ACTION_PUSH_CONFIG, AuditLog.ENTITY_CONFIG,
+                       cfg.id, cfg_fname,
+                       details=f'service={svc_name} v{ver_num} -> {ok_count}/{len(results)} instances',
+                       result=AuditLog.RESULT_OK if all_ok else AuditLog.RESULT_WARNING,
+                       username=req_username, ip_address=client_ip)
         except Exception as exc:
             tq.put({'type': 'done_all', 'ok': False, 'results': results, 'error': str(exc)})
         finally:
@@ -1396,6 +1439,7 @@ def manage_inst_deploy(iid):
     tq: queue.Queue = queue.Queue()
     _tasks[task_id] = {'q': tq, 'done': False}
     client_ip = _client_ip()
+    req_username = _current_username()
     inst_id = inst.id
     _ver_id = ver.id
     ver_num = ver.version
@@ -1442,6 +1486,12 @@ def manage_inst_deploy(iid):
                     parts.append(f'файл: {"ok" if write_ok else "ERR: " + write_msg}')
                 if do_restart:
                     parts.append(f'restart: {"ok" if restart_ok else "ERR: " + restart_msg}')
+                _audit(AuditLog.ACTION_PUSH_CONFIG, AuditLog.ENTITY_CONFIG,
+                       cfg_id, cfg_fname,
+                       details=f'instance={win_name}@{hostname} v{ver_num}' +
+                               (' | ' + '; '.join(parts) if parts else ''),
+                       result=AuditLog.RESULT_OK if ok else AuditLog.RESULT_ERROR,
+                       username=req_username, ip_address=client_ip)
                 tq.put({'type': 'done', 'instance_id': inst_id, 'ok': ok,
                         'message': '; '.join(parts) or 'ok',
                         'status': new_status, 'version': ver_num,
