@@ -35,4 +35,4 @@ ENV FLASK_PORT=5000
 EXPOSE 5000
 
 ENTRYPOINT ["sh", "-c"]
-CMD ["gunicorn --bind 0.0.0.0:${FLASK_PORT} --worker-class gevent --workers 2 --timeout 120 'app:create_app()'"]
+CMD ["gunicorn --preload --bind 0.0.0.0:${FLASK_PORT} --worker-class gevent --workers 2 --timeout 120 'app:create_app()'"]

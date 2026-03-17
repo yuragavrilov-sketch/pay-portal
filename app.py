@@ -113,6 +113,8 @@ def create_app():
         _ensure_schema(app)
         db.create_all()
         _run_migrations()
+        # Close init connections so forked gunicorn workers get fresh ones
+        db.engine.dispose()
 
     # ------------------------------------------------------------------
     # Register Auth blueprint (login / logout / refresh / me)
