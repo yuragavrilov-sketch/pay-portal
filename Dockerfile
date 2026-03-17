@@ -30,8 +30,9 @@ COPY --from=frontend-build /static/react ./static/react/
 ENV FLASK_ENV=production
 ENV PYTHONUNBUFFERED=1
 ENV DB_SCHEMA=svcmgr
+ENV FLASK_PORT=5000
 
-EXPOSE 5000
+EXPOSE ${FLASK_PORT}
 
 # Run with gunicorn (gevent for SSE streaming support)
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--worker-class", "gevent", "--workers", "2", "--timeout", "120", "app:create_app()"]
+CMD sh -c "gunicorn --bind 0.0.0.0:${FLASK_PORT} --worker-class gevent --workers 2 --timeout 120 'app:create_app()'"
