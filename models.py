@@ -143,12 +143,9 @@ class ServiceConfig(db.Model):
         v = self.current_version
         return v.version if v else None
 
-    __table_args__ = (
-        # Уникальность: один конфиг с данным именем на (сервис, env).
-        # Для NULL env используем отдельный partial index в _migrate_db.
-        db.UniqueConstraint('service_id', 'filename', 'env_id',
-                            name='uq_service_config_filename_env'),
-    )
+    # Uniqueness enforced by partial indexes in migrations:
+    # uq_svc_cfg_filename_global (env_id IS NULL)
+    # uq_svc_cfg_filename_env   (env_id IS NOT NULL)
 
     def __repr__(self):
         return f'<ServiceConfig {self.filename} service={self.service_id} env={self.env_id}>'

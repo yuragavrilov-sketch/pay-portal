@@ -14,6 +14,39 @@ from logger import setup_logging
 log = logging.getLogger(__name__)
 
 
+# =========================================================================
+# Versioned migrations — each runs exactly once, tracked in _schema_migrations
+# =========================================================================
+MIGRATIONS = [
+    (1, "add source tracking to instance_configs", """
+        ALTER TABLE instance_configs
+          ADD COLUMN IF NOT EXISTS source_version_id INTEGER
+          REFERENCES service_config_versions(id) ON DELETE SET NULL;
+        ALTER TABLE instance_configs
+          ADD COLUMN IF NOT EXISTS is_overridden BOOLEAN NOT NULL DEFAULT FALSE;
+    """),
+    (2, "add env_id to service_configs", """
+        ALTER TABLE service_configs
+          ADD COLUMN IF NOT EXISTS env_id INTEGER
+          REFERENCES environments(id) ON DELETE SET NULL;
+    """),
+    (3, "add username to audit_log", """
+        ALTER TABLE audit_log
+          ADD COLUMN IF NOT EXISTS username VARCHAR(128);
+    """),
+    (4, "replace unique constraint with partial indexes on service_configs", """
+        ALTER TABLE service_configs
+          DROP CONSTRAINT IF EXISTS uq_service_config_filename;
+        ALTER TABLE service_configs
+          DROP CONSTRAINT IF EXISTS uq_service_config_filename_env;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_svc_cfg_filename_global
+          ON service_configs(service_id, filename) WHERE env_id IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_svc_cfg_filename_env
+          ON service_configs(service_id, filename, env_id) WHERE env_id IS NOT NULL;
+    """),
+]
+
+
 def _ensure_schema(app):
     """Create the application PostgreSQL schema if it doesn't exist and set search_path."""
     schema = app.config.get('DB_SCHEMA', '')
@@ -43,87 +76,41 @@ def _ensure_schema(app):
             log.info("Database schema already exists: %s", schema)
 
 
-def _migrate_db(app):
-    """Idempotent: добавляет новые колонки в существующие таблицы (PostgreSQL)."""
-    schema = app.config.get('DB_SCHEMA', '') or 'public'
+def _run_migrations():
+    """Apply pending versioned migrations."""
+    with db.engine.connect() as conn:
+        # Ensure tracking table exists
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS _schema_migrations (
+                version  INTEGER PRIMARY KEY,
+                name     VARCHAR(256) NOT NULL,
+                applied_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.commit()
 
-    with app.app_context():
-        with db.engine.connect() as conn:
-            col_checks = [
-                (
-                    "instance_configs", "source_version_id",
-                    "ALTER TABLE instance_configs "
-                    "ADD COLUMN source_version_id INTEGER "
-                    "REFERENCES service_config_versions(id) ON DELETE SET NULL",
-                ),
-                (
-                    "instance_configs", "is_overridden",
-                    "ALTER TABLE instance_configs "
-                    "ADD COLUMN is_overridden BOOLEAN NOT NULL DEFAULT FALSE",
-                ),
-                (
-                    "service_configs", "env_id",
-                    "ALTER TABLE service_configs "
-                    "ADD COLUMN env_id INTEGER "
-                    "REFERENCES environments(id) ON DELETE SET NULL",
-                ),
-                (
-                    "audit_log", "username",
-                    "ALTER TABLE audit_log "
-                    "ADD COLUMN username VARCHAR(128)",
-                ),
-            ]
-            for table, column, ddl in col_checks:
-                row = conn.execute(text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema=:s AND table_name=:t AND column_name=:c"
-                ), {"s": schema, "t": table, "c": column}).fetchone()
-                if not row:
-                    conn.execute(text(ddl))
+        # Get current version
+        current = conn.execute(text(
+            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations"
+        )).scalar() or 0
 
-            old_con = conn.execute(text(
-                "SELECT constraint_name FROM information_schema.table_constraints "
-                "WHERE table_schema=:s AND table_name='service_configs' "
-                "AND constraint_name='uq_service_config_filename'"
-            ), {"s": schema}).fetchone()
-            if old_con:
-                conn.execute(text(
-                    "ALTER TABLE service_configs DROP CONSTRAINT uq_service_config_filename"
-                ))
-
-            new_con = conn.execute(text(
-                "SELECT constraint_name FROM information_schema.table_constraints "
-                "WHERE table_schema=:s AND table_name='service_configs' "
-                "AND constraint_name='uq_service_config_filename_env'"
-            ), {"s": schema}).fetchone()
-            if new_con:
-                conn.execute(text(
-                    "ALTER TABLE service_configs DROP CONSTRAINT uq_service_config_filename_env"
-                ))
-
-            idx_null = conn.execute(text(
-                "SELECT indexname FROM pg_indexes "
-                "WHERE schemaname=:s AND tablename='service_configs' "
-                "AND indexname='uq_svc_cfg_filename_global'"
-            ), {"s": schema}).fetchone()
-            if not idx_null:
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX uq_svc_cfg_filename_global "
-                    "ON service_configs(service_id, filename) WHERE env_id IS NULL"
-                ))
-
-            idx_env = conn.execute(text(
-                "SELECT indexname FROM pg_indexes "
-                "WHERE schemaname=:s AND tablename='service_configs' "
-                "AND indexname='uq_svc_cfg_filename_env'"
-            ), {"s": schema}).fetchone()
-            if not idx_env:
-                conn.execute(text(
-                    "CREATE UNIQUE INDEX uq_svc_cfg_filename_env "
-                    "ON service_configs(service_id, filename, env_id) WHERE env_id IS NOT NULL"
-                ))
-
+        applied = 0
+        for version, name, sql in MIGRATIONS:
+            if version <= current:
+                continue
+            log.info("Applying migration %d: %s", version, name)
+            conn.execute(text(sql))
+            conn.execute(text(
+                "INSERT INTO _schema_migrations (version, name) VALUES (:v, :n)"
+            ), {"v": version, "n": name})
             conn.commit()
+            applied += 1
+            log.info("Migration %d applied", version)
+
+        if applied:
+            log.info("Applied %d migration(s), current version: %d", applied, MIGRATIONS[-1][0])
+        else:
+            log.info("Database is up to date (version %d)", current)
 
 
 def create_app():
@@ -138,7 +125,7 @@ def create_app():
     with app.app_context():
         _ensure_schema(app)
         db.create_all()
-        _migrate_db(app)
+        _run_migrations()
 
     # ------------------------------------------------------------------
     # Register Auth blueprint (login / logout / refresh / me)
@@ -158,14 +145,11 @@ def create_app():
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
     def serve_react(path):
-        # Serve static assets from React build
         if path and os.path.isfile(os.path.join(react_dir, path)):
             return send_from_directory(react_dir, path)
-        # For all other routes, serve React index.html (SPA routing)
         index_path = os.path.join(react_dir, 'index.html')
         if os.path.isfile(index_path):
             return send_from_directory(react_dir, 'index.html')
-        # Fallback: if React not built yet
         return ('<h3>React app not built yet</h3>'
                 '<p>Run <code>cd frontend && npm install && npm run build</code></p>'), 200
 
