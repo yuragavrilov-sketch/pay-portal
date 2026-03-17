@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, send_from_directory
-from sqlalchemy import event, text
+from sqlalchemy import text
 from models import db
 from logger import setup_logging
 
@@ -48,7 +48,7 @@ MIGRATIONS = [
 
 
 def _ensure_schema(app):
-    """Create the application PostgreSQL schema if it doesn't exist and set search_path."""
+    """Create the application PostgreSQL schema if it doesn't exist."""
     schema = app.config.get('DB_SCHEMA', '')
     if not schema:
         return
@@ -56,24 +56,11 @@ def _ensure_schema(app):
     if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', schema):
         raise ValueError(f"Invalid DB_SCHEMA value: {schema!r}")
 
-    # Set search_path for every new connection via engine event
-    @event.listens_for(db.engine, "connect")
-    def set_search_path(dbapi_conn, connection_record):
-        cursor = dbapi_conn.cursor()
-        cursor.execute(f"SET search_path TO {schema}, public")
-        cursor.close()
-
-    # Create the schema if it doesn't exist
+    # search_path is already set via SQLALCHEMY_ENGINE_OPTIONS connect_args
     with db.engine.connect() as conn:
-        exists = conn.execute(text(
-            "SELECT 1 FROM information_schema.schemata WHERE schema_name = :s"
-        ), {"s": schema}).fetchone()
-        if not exists:
-            conn.execute(text(f"CREATE SCHEMA {schema}"))
-            conn.commit()
-            log.info("Created database schema: %s", schema)
-        else:
-            log.info("Database schema already exists: %s", schema)
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
+        conn.commit()
+        log.info("Ensured database schema: %s", schema)
 
 
 def _run_migrations():

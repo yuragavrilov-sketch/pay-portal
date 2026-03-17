@@ -32,7 +32,7 @@ ENV PYTHONUNBUFFERED=1
 ENV DB_SCHEMA=svcmgr
 ENV FLASK_PORT=5000
 
-EXPOSE ${FLASK_PORT}
+EXPOSE 5000
 
-# Run with gunicorn (gevent for SSE streaming support)
-CMD sh -c "gunicorn --bind 0.0.0.0:${FLASK_PORT} --worker-class gevent --workers 2 --timeout 120 'app:create_app()'"
+ENTRYPOINT ["sh", "-c"]
+CMD ["gunicorn --bind 0.0.0.0:${FLASK_PORT} --worker-class gevent --workers 2 --timeout 120 'app:create_app()'"]

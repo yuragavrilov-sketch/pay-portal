@@ -13,6 +13,16 @@ class Config:
     # PostgreSQL schema (empty string = use default 'public')
     DB_SCHEMA = os.environ.get('DB_SCHEMA', 'svcmgr')
 
+    # Set search_path at the PostgreSQL protocol level so every connection
+    # (including pool checkouts) has the correct schema from the start.
+    SQLALCHEMY_ENGINE_OPTIONS = {}
+    if DB_SCHEMA:
+        SQLALCHEMY_ENGINE_OPTIONS = {
+            'connect_args': {
+                'options': f'-c search_path={DB_SCHEMA},public'
+            }
+        }
+
     # Keycloak
     KEYCLOAK_URL = os.environ.get('KEYCLOAK_URL', 'http://localhost:8080')
     KEYCLOAK_REALM = os.environ.get('KEYCLOAK_REALM', 'svcmgr')
