@@ -10,6 +10,9 @@ class Config:
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
+    # PostgreSQL schema (empty string = use default 'public')
+    DB_SCHEMA = os.environ.get('DB_SCHEMA', 'svcmgr')
+
     # Keycloak
     KEYCLOAK_URL = os.environ.get('KEYCLOAK_URL', 'http://localhost:8080')
     KEYCLOAK_REALM = os.environ.get('KEYCLOAK_REALM', 'svcmgr')

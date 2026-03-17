@@ -1,20 +1,52 @@
 """Service Management Portal — Flask application (React frontend)."""
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, send_from_directory
-from sqlalchemy import text
+from sqlalchemy import event, text
 from models import db
 from logger import setup_logging
 
 log = logging.getLogger(__name__)
 
 
+def _ensure_schema(app):
+    """Create the application PostgreSQL schema if it doesn't exist and set search_path."""
+    schema = app.config.get('DB_SCHEMA', '')
+    if not schema:
+        return
+
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', schema):
+        raise ValueError(f"Invalid DB_SCHEMA value: {schema!r}")
+
+    # Set search_path for every new connection via engine event
+    @event.listens_for(db.engine, "connect")
+    def set_search_path(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute(f"SET search_path TO {schema}, public")
+        cursor.close()
+
+    # Create the schema if it doesn't exist
+    with db.engine.connect() as conn:
+        exists = conn.execute(text(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = :s"
+        ), {"s": schema}).fetchone()
+        if not exists:
+            conn.execute(text(f"CREATE SCHEMA {schema}"))
+            conn.commit()
+            log.info("Created database schema: %s", schema)
+        else:
+            log.info("Database schema already exists: %s", schema)
+
+
 def _migrate_db(app):
     """Idempotent: добавляет новые колонки в существующие таблицы (PostgreSQL)."""
+    schema = app.config.get('DB_SCHEMA', '') or 'public'
+
     with app.app_context():
         with db.engine.connect() as conn:
             col_checks = [
@@ -44,16 +76,16 @@ def _migrate_db(app):
             for table, column, ddl in col_checks:
                 row = conn.execute(text(
                     "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name=:t AND column_name=:c"
-                ), {"t": table, "c": column}).fetchone()
+                    "WHERE table_schema=:s AND table_name=:t AND column_name=:c"
+                ), {"s": schema, "t": table, "c": column}).fetchone()
                 if not row:
                     conn.execute(text(ddl))
 
             old_con = conn.execute(text(
                 "SELECT constraint_name FROM information_schema.table_constraints "
-                "WHERE table_name='service_configs' "
+                "WHERE table_schema=:s AND table_name='service_configs' "
                 "AND constraint_name='uq_service_config_filename'"
-            )).fetchone()
+            ), {"s": schema}).fetchone()
             if old_con:
                 conn.execute(text(
                     "ALTER TABLE service_configs DROP CONSTRAINT uq_service_config_filename"
@@ -61,9 +93,9 @@ def _migrate_db(app):
 
             new_con = conn.execute(text(
                 "SELECT constraint_name FROM information_schema.table_constraints "
-                "WHERE table_name='service_configs' "
+                "WHERE table_schema=:s AND table_name='service_configs' "
                 "AND constraint_name='uq_service_config_filename_env'"
-            )).fetchone()
+            ), {"s": schema}).fetchone()
             if new_con:
                 conn.execute(text(
                     "ALTER TABLE service_configs DROP CONSTRAINT uq_service_config_filename_env"
@@ -71,9 +103,9 @@ def _migrate_db(app):
 
             idx_null = conn.execute(text(
                 "SELECT indexname FROM pg_indexes "
-                "WHERE tablename='service_configs' "
+                "WHERE schemaname=:s AND tablename='service_configs' "
                 "AND indexname='uq_svc_cfg_filename_global'"
-            )).fetchone()
+            ), {"s": schema}).fetchone()
             if not idx_null:
                 conn.execute(text(
                     "CREATE UNIQUE INDEX uq_svc_cfg_filename_global "
@@ -82,9 +114,9 @@ def _migrate_db(app):
 
             idx_env = conn.execute(text(
                 "SELECT indexname FROM pg_indexes "
-                "WHERE tablename='service_configs' "
+                "WHERE schemaname=:s AND tablename='service_configs' "
                 "AND indexname='uq_svc_cfg_filename_env'"
-            )).fetchone()
+            ), {"s": schema}).fetchone()
             if not idx_env:
                 conn.execute(text(
                     "CREATE UNIQUE INDEX uq_svc_cfg_filename_env "
@@ -104,6 +136,7 @@ def create_app():
     setup_logging(app)
 
     with app.app_context():
+        _ensure_schema(app)
         db.create_all()
         _migrate_db(app)
 
