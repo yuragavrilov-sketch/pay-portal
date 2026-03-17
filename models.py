@@ -1,8 +1,15 @@
+import os
 from datetime import datetime
+
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import MetaData
 from crypto import EncryptedString
 
-db = SQLAlchemy()
+# Explicit schema on MetaData makes create_all() generate
+# schema-qualified DDL: CREATE TABLE svcmgr.environments (...)
+# This avoids FK resolution issues with search_path.
+_schema = os.environ.get('DB_SCHEMA', '') or None
+db = SQLAlchemy(metadata=MetaData(schema=_schema))
 
 
 # ---------------------------------------------------------------------------

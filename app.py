@@ -13,7 +13,7 @@ from logger import setup_logging
 
 log = logging.getLogger(__name__)
 
-# Advisory lock ID (arbitrary large constant)
+# Advisory lock ID (arbitrary constant)
 _DB_INIT_LOCK = 737_000_001
 
 # =========================================================================
@@ -50,19 +50,13 @@ MIGRATIONS = [
 
 
 def _init_db(app):
-    """Create schema, tables and run migrations under an advisory lock.
-
-    The lock ensures that when multiple gunicorn workers start at the same
-    time, only ONE actually runs DDL; the others wait and then skip.
-    """
+    """Create schema, tables and run migrations under advisory lock."""
     schema = app.config.get('DB_SCHEMA', '')
 
     with db.engine.connect() as conn:
-        # ── Acquire advisory lock (blocks until available) ──────────
         conn.execute(text("SELECT pg_advisory_lock(:id)"), {"id": _DB_INIT_LOCK})
-
         try:
-            # ── 1. Ensure schema exists ─────────────────────────────
+            # ── 1. Ensure schema ────────────────────────────────────
             if schema:
                 if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', schema):
                     raise ValueError(f"Invalid DB_SCHEMA value: {schema!r}")
@@ -70,12 +64,11 @@ def _init_db(app):
                 conn.commit()
                 log.info("Ensured database schema: %s", schema)
 
-            # ── 2. Create tables from models ────────────────────────
-            db.metadata.create_all(bind=conn, checkfirst=True)
-            conn.commit()
+            # ── 2. Create tables (schema-qualified via MetaData) ────
+            db.create_all()
             log.info("Tables ensured")
 
-            # ── 3. Run versioned migrations ─────────────────────────
+            # ── 3. Versioned migrations (raw SQL via search_path) ───
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS _schema_migrations (
                     version    INTEGER PRIMARY KEY,
@@ -109,7 +102,6 @@ def _init_db(app):
                 log.info("Database is up to date (version %d)", current)
 
         finally:
-            # ── Release advisory lock ───────────────────────────────
             conn.execute(text("SELECT pg_advisory_unlock(:id)"),
                          {"id": _DB_INIT_LOCK})
             conn.commit()
@@ -128,21 +120,12 @@ def create_app():
         _init_db(app)
         db.engine.dispose()
 
-    # ------------------------------------------------------------------
-    # Register Auth blueprint (login / logout / refresh / me)
-    # ------------------------------------------------------------------
     from auth import auth as auth_bp
     app.register_blueprint(auth_bp)
 
-    # ------------------------------------------------------------------
-    # Register API blueprint (all JSON endpoints)
-    # ------------------------------------------------------------------
     from api_routes import api as api_bp
     app.register_blueprint(api_bp)
 
-    # ------------------------------------------------------------------
-    # Serve React SPA
-    # ------------------------------------------------------------------
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
     def serve_react(path):
