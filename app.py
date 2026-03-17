@@ -13,6 +13,8 @@ from logger import setup_logging
 
 log = logging.getLogger(__name__)
 
+# Advisory lock ID (arbitrary large constant)
+_DB_INIT_LOCK = 737_000_001
 
 # =========================================================================
 # Versioned migrations — each runs exactly once, tracked in _schema_migrations
@@ -47,57 +49,70 @@ MIGRATIONS = [
 ]
 
 
-def _ensure_schema(app):
-    """Create the application PostgreSQL schema if it doesn't exist."""
+def _init_db(app):
+    """Create schema, tables and run migrations under an advisory lock.
+
+    The lock ensures that when multiple gunicorn workers start at the same
+    time, only ONE actually runs DDL; the others wait and then skip.
+    """
     schema = app.config.get('DB_SCHEMA', '')
-    if not schema:
-        return
 
-    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', schema):
-        raise ValueError(f"Invalid DB_SCHEMA value: {schema!r}")
-
-    # search_path is already set via SQLALCHEMY_ENGINE_OPTIONS connect_args
     with db.engine.connect() as conn:
-        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
-        conn.commit()
-        log.info("Ensured database schema: %s", schema)
+        # ── Acquire advisory lock (blocks until available) ──────────
+        conn.execute(text("SELECT pg_advisory_lock(:id)"), {"id": _DB_INIT_LOCK})
 
+        try:
+            # ── 1. Ensure schema exists ─────────────────────────────
+            if schema:
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', schema):
+                    raise ValueError(f"Invalid DB_SCHEMA value: {schema!r}")
+                conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
+                conn.commit()
+                log.info("Ensured database schema: %s", schema)
 
-def _run_migrations():
-    """Apply pending versioned migrations."""
-    with db.engine.connect() as conn:
-        # Ensure tracking table exists
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS _schema_migrations (
-                version  INTEGER PRIMARY KEY,
-                name     VARCHAR(256) NOT NULL,
-                applied_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        conn.commit()
-
-        # Get current version
-        current = conn.execute(text(
-            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations"
-        )).scalar() or 0
-
-        applied = 0
-        for version, name, sql in MIGRATIONS:
-            if version <= current:
-                continue
-            log.info("Applying migration %d: %s", version, name)
-            conn.execute(text(sql))
-            conn.execute(text(
-                "INSERT INTO _schema_migrations (version, name) VALUES (:v, :n)"
-            ), {"v": version, "n": name})
+            # ── 2. Create tables from models ────────────────────────
+            db.metadata.create_all(bind=conn, checkfirst=True)
             conn.commit()
-            applied += 1
-            log.info("Migration %d applied", version)
+            log.info("Tables ensured")
 
-        if applied:
-            log.info("Applied %d migration(s), current version: %d", applied, MIGRATIONS[-1][0])
-        else:
-            log.info("Database is up to date (version %d)", current)
+            # ── 3. Run versioned migrations ─────────────────────────
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS _schema_migrations (
+                    version    INTEGER PRIMARY KEY,
+                    name       VARCHAR(256) NOT NULL,
+                    applied_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.commit()
+
+            current = conn.execute(text(
+                "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations"
+            )).scalar() or 0
+
+            applied = 0
+            for version, name, sql in MIGRATIONS:
+                if version <= current:
+                    continue
+                log.info("Applying migration %d: %s", version, name)
+                conn.execute(text(sql))
+                conn.execute(text(
+                    "INSERT INTO _schema_migrations (version, name) VALUES (:v, :n)"
+                ), {"v": version, "n": name})
+                conn.commit()
+                applied += 1
+                log.info("Migration %d applied", version)
+
+            if applied:
+                log.info("Applied %d migration(s), current version: %d",
+                         applied, MIGRATIONS[-1][0])
+            else:
+                log.info("Database is up to date (version %d)", current)
+
+        finally:
+            # ── Release advisory lock ───────────────────────────────
+            conn.execute(text("SELECT pg_advisory_unlock(:id)"),
+                         {"id": _DB_INIT_LOCK})
+            conn.commit()
 
 
 def create_app():
@@ -110,10 +125,7 @@ def create_app():
     setup_logging(app)
 
     with app.app_context():
-        _ensure_schema(app)
-        db.create_all()
-        _run_migrations()
-        # Close init connections so forked gunicorn workers get fresh ones
+        _init_db(app)
         db.engine.dispose()
 
     # ------------------------------------------------------------------
